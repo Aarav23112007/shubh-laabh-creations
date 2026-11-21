@@ -1,6 +1,13 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Shubh Laabh Creations</title>
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#0D5561">
+<link rel="icon" type="image/png" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-180.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Shubh Laabh">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Marcellus&family=Figtree:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@500;600&display=swap">
@@ -2111,6 +2118,37 @@ $('#fileAdminExtra').addEventListener('change',async e=>{ const fs=[...e.target.
 render();
 Backend.check().then(render);
 Matcher.ready();   // index catalogue photos in the background
+</script>
+
+<script>
+/* ---------- offline support: installable app that opens without internet ----------
+   sw.js saves the app + scanner/PDF libraries on the phone. Not used on localhost, so your
+   edits there still show on a plain refresh; add ?sw=1 to the address to test it there. */
+(function(){
+  if(!('serviceWorker' in navigator)) return;
+  if(['localhost','127.0.0.1'].includes(location.hostname) && !/[?&]sw=1/.test(location.search)) return;
+  const status = async () => {
+    const out={worker:!!navigator.serviceWorker.controller, libs:0, model:false, pdf:false};
+    try{ const c=await caches.open('slc-cdn-v1'); out.libs=(await c.keys()).length; }catch(e){}
+    try{ out.model=(await (await caches.open('transformers-cache')).keys()).some(r=>/\.onnx(\?|$)/.test(r.url)); }catch(e){}   // the scanner's model file itself, not just its small settings files
+    out.pdf=!!window.jspdf;
+    out.ready = out.worker && out.libs>=4 && out.model;
+    return out;
+  };
+  window.offlineStatus = status;
+  addEventListener('load',()=>{
+    navigator.serviceWorker.register('sw.js').then(()=>navigator.serviceWorker.ready).then(async()=>{
+      // fetch the PDF library now, while there is internet, so invoices also work offline
+      try{ if(navigator.onLine && typeof loadJsPDF==='function') await loadJsPDF(); }catch(e){}
+      // tell the user once, when the scanner model has also finished saving
+      for(let i=0;i<60;i++){
+        const st=await status();
+        if(st.ready){ try{ if(!localStorage.getItem('slc-offline-ok')){ localStorage.setItem('slc-offline-ok','1'); toast('✓ Saved on this phone. Works offline now.'); } }catch(e){} return; }
+        await new Promise(r=>setTimeout(r,5000));
+      }
+    }).catch(e=>console.warn('Offline mode not available:',e));
+  });
+})();
 </script>
 
 </html>
