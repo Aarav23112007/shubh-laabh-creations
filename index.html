@@ -1136,10 +1136,88 @@ const Inventory = {
   adjust(serial,delta,note){ const p=Products.get(serial); const from=p.stock; p.stock=Math.max(0,from+delta); this.log(delta>=0?'in':'out',serial,p.stock-from,from,p.stock,note); save(); SheetSync.push(); }
 };
 
-/* ---------- Google Sheets sync (SIMULATED) ---------- */
-const SheetSync = {
-  push(){ DB.settings.syncing=true; save(); setTimeout(()=>{ DB.settings.syncing=false; DB.settings.lastSync=Date.now(); save(); if(['home','sync'].includes(S.view)) render(); },1400); }
+/* ---------- Google Sheets sync (REAL: talks to the Apps Script web app) ---------- */
+const SheetCfg = {
+  get(){ try{ return JSON.parse(localStorage.getItem('slc-sheet-cfg')||'null')||{}; }catch(e){ return {}; } },
+  set(c){ try{ localStorage.setItem('slc-sheet-cfg',JSON.stringify(c)); }catch(e){} }
 };
+const shHash = t => { let h=5381; t=String(t); for(let i=0;i<t.length;i+=5) h=((h<<5)+h+t.charCodeAt(i))|0; return t.length+'-'+(h>>>0).toString(36); };
+const SheetSync = {
+  running:false, again:false, error:'', note:'',
+  cfg(){ return SheetCfg.get(); },
+  on(){ const c=this.cfg(); return !!(c.url && c.token); },
+  pending(){ return DB.sales.filter(x=>!x.sheetOk).length; },
+  async call(action,payload,ms){
+    const c=this.cfg(), ctl=new AbortController(), t=setTimeout(()=>ctl.abort(), ms||120000);
+    try{
+      const r=await fetch(c.url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({token:c.token,action,...(payload||{})}),signal:ctl.signal});
+      let j; try{ j=await r.json(); }catch(e){ throw new Error('The link did not answer like the Shubh Laabh script. Check the web app link.'); }
+      if(!j.ok) throw new Error(j.error==='Wrong code' ? 'Wrong secret code' : (j.error||'The sheet refused the request'));
+      return j;
+    }catch(e){ throw new Error(e.name==='AbortError' ? 'Took too long. Try again on better internet.' : (e.message==='Failed to fetch' ? 'No internet, or the web app link is wrong' : e.message)); }
+    finally{ clearTimeout(t); }
+  },
+  row(p){ return {code:ser(p.serial), name:p.name, category:p.category, priceIndia:p.price, priceIntl:(p.priceIntl==null?'':p.priceIntl), size:p.size||'', stock:p.stock, description:p.description||''}; },
+  bill(x){ return {invoice:x.no, date:(()=>{ const d=new Date(x.date), p=n=>String(n).padStart(2,'0'); return isNaN(d)?'':`${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`; })(), customer:x.customer, phone:x.phone||'', email:x.email||'', country:x.country||'', currency:saleCur(x),
+    items:x.items.map(i=>`${ser(i.serial)} ${i.name}${i.size?' ('+i.size+')':''} x${i.qty} @ ${i.rate}`).join('; '),
+    subtotal:x.subtotal, discount:x.discount, total:x.total, payment:x.payment||'', sentVia:(x.shared&&Object.keys(x.shared).join(', '))||''}; },
+  refresh(){ if(['home','sync'].includes(S.view) && !(S.view==='sync' && S.typing)) render(); },
+  async push(force){
+    if(!this.on()) return;
+    if(this.running){ this.again=true; return; }
+    if(!navigator.onLine){ this.error='Offline. Will send when the internet is back.'; this.refresh(); return; }
+    this.running=true; this.error=''; DB.settings.syncing=true; this.refresh();
+    try{
+      const st=DB.settings; st.rowSent=st.rowSent||{}; st.photoSent=st.photoSent||{};
+      if(force){ st.rowSent={}; st.photoSent={}; DB.sales.forEach(x=>{ x.sheetOk=false; }); }
+      // 1. bills not yet in the sheet (oldest first)
+      for(const x of DB.sales.filter(y=>!y.sheetOk).reverse()){ await this.call('addBill',{bill:this.bill(x)}); x.sheetOk=true; save(); }
+      // 2. products whose text changed
+      const changed=DB.products.filter(p=>st.rowSent[p.serial]!==shHash(JSON.stringify(this.row(p))));
+      for(let i=0;i<changed.length;i+=40){
+        const part=changed.slice(i,i+40);
+        await this.call('saveProducts',{products:part.map(p=>this.row(p))});
+        part.forEach(p=>{ st.rowSent[p.serial]=shHash(JSON.stringify(this.row(p))); }); save();
+      }
+      // 3. photos not yet uploaded (3 at a time, they are big)
+      const pics=DB.products.filter(p=>p.photo && st.photoSent[p.serial]!==shHash(p.photo));
+      for(let i=0;i<pics.length;i+=3){
+        const part=pics.slice(i,i+3);
+        await this.call('saveProducts',{products:part.map(p=>({...this.row(p),photo:p.photo,photoKey:shHash(p.photo)}))},180000);
+        part.forEach(p=>{ st.photoSent[p.serial]=shHash(p.photo); }); save();
+      }
+      st.lastSync=Date.now();
+    }catch(e){ this.error=e.message; }
+    finally{
+      this.running=false; DB.settings.syncing=false; save();
+      if(this.again){ this.again=false; setTimeout(()=>this.push(),300); }
+      this.refresh();
+    }
+  },
+  async test(){ await this.call('ping',{},30000); },
+  async pull(){
+    if(!navigator.onLine) throw new Error('You are offline');
+    const j=await this.call('getProducts',{withPhotos:true},300000);
+    let n=0;
+    for(const r of (j.products||[])){
+      const serial=parseInt(r.code,10); if(!(serial>0)) continue;
+      const price=+r.priceIndia||0, priceIntl=(r.priceIntl===''||r.priceIntl==null)?intlDefault(price):+r.priceIntl;
+      let p=Products.get(serial);
+      const cat=CATEGORIES.includes(r.category)?r.category:C;
+      const f={name:String(r.name||'Product '+ser(serial)),category:cat,price,priceIntl,stock:Math.max(0,parseInt(r.stock,10)||0),size:String(r.size||''),description:String(r.description||'')};
+      if(p){ Object.assign(p,f); if(r.photo) p.photo=r.photo; }
+      else{ p={serial,...f,art:DEFAULT_ART[cat],group:'',photo:r.photo||null,refs:[],refImgs:[]}; DB.products.push(p); }
+      DB.settings.rowSent=DB.settings.rowSent||{}; DB.settings.photoSent=DB.settings.photoSent||{};
+      DB.settings.rowSent[serial]=shHash(JSON.stringify(this.row(p))); if(p.photo) DB.settings.photoSent[serial]=shHash(p.photo);
+      n++;
+    }
+    DB.products.sort((a,b)=>a.serial-b.serial);
+    save(); DB.products.forEach(p=>{ try{ Matcher.indexProduct(p); }catch(e){} });
+    return n;
+  }
+};
+addEventListener('online',()=>SheetSync.push());
+setTimeout(()=>SheetSync.push(),4000);
 
 /* ---------- Metrics ---------- */
 const Metrics = {
@@ -1169,7 +1247,7 @@ function topbar(title,{sub='',back:showBack}={}){
   const b = showBack ?? (S.stack.length>0 || (S.view==='scan' && S.scan.phase!=='camera'));
   return `<header class="top"><div class="top-row">${b?`<button class="icon-btn" data-act="back" aria-label="Back">${ic('back')}</button>`:''}<div class="top-title"><h1>${esc(title)}</h1>${sub?`<p>${esc(sub)}</p>`:''}</div>${EMBLEM}</div></header>`;
 }
-function syncPill(){ const st=DB.settings; return `<span class="pill-dark"><span class="dot ${st.syncing?'busy':''}"></span>${st.syncing?'Syncing to Google Sheets…':'Google Sheets synced '+ago(st.lastSync)} <em style="opacity:.6;font-style:normal">(demo)</em></span>`; }
+function syncPill(){ const st=DB.settings, on=SheetSync.on(), n=SheetSync.pending(); return `<span class="pill-dark"><span class="dot ${st.syncing?'busy':''}"></span>${!on?'Google Sheet not connected':st.syncing?'Syncing to Google Sheet…':SheetSync.error?'Sheet: waiting ('+(n||'')+(n?' bills ':'')+'pending)':'Google Sheet synced '+ago(st.lastSync)}</span>`; }
 function brandHeader(){
   return `<header class="brand"><div class="brand-row">${EMBLEM}<div><div class="brand-name">SHUBH LAABH CREATIONS</div><div class="brand-sub">Handmade Wall Hanging &amp; Decorative Products</div></div></div>
   <div class="brand-meta"><span class="pill-dark">${ic('store')}${esc(EVENT)}</span>${syncPill()}</div></header><div class="toran-edge"></div>`;
@@ -1396,7 +1474,7 @@ V.invoice = () => {
   const fresh=S.params.fresh;
   return `${topbar(fresh?'Bill generated':'Invoice',{sub:s.no,back:!fresh})}<div class="pad stack">
     ${fresh?`<div class="note ok">${ic('check')}<span><b>Payment recorded and stock updated.</b> ${money(s.total,saleCur(s))} received by ${esc(s.payment)}.</span></div>
-    <div class="card impact"><b style="font-size:13px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)">Stock updated automatically</b>${s.stockChanges.map(c=>`<div><span>No. ${ser(c.serial)} · ${esc(c.name)}</span><b>${c.from} → ${c.to}${c.to===0?' <span class="badge b-out">Out</span>':c.to<=LOW?' <span class="badge b-low">Low</span>':''}</b></div>`).join('')}<small class="muted">${DB.settings.syncing?'Syncing to Google Sheets…':'Synced to Google Sheets (demo)'}</small></div>`:''}
+    <div class="card impact"><b style="font-size:13px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)">Stock updated automatically</b>${s.stockChanges.map(c=>`<div><span>No. ${ser(c.serial)} · ${esc(c.name)}</span><b>${c.from} → ${c.to}${c.to===0?' <span class="badge b-out">Out</span>':c.to<=LOW?' <span class="badge b-low">Low</span>':''}</b></div>`).join('')}<small class="muted">${!SheetSync.on()?'Google Sheet not connected':DB.settings.syncing?'Sending to Google Sheet…':SheetSync.error?'Saved on this phone. Will reach the Google Sheet when online.':'Sent to Google Sheet'}</small></div>`:''}
     ${sendCard(s)}
     ${invoiceDoc(s)}
     ${fresh?`<button class="btn btn-gold btn-xl" data-act="newBill">${ic('camera')} Next customer · scan</button><button class="btn btn-primary" data-act="tab" data-arg="home">${ic('home')} See updated dashboard</button>`:''}
@@ -1592,7 +1670,7 @@ V.more = () => {
   const row=(act,arg,icon,t,sub)=>`<button class="list-row" data-act="${act}" data-arg="${arg}">${ic(icon)}<span class="lr-main"><b>${t}</b><small>${sub}</small></span>${ic('chev','chev')}</button>`;
   return `${topbar('More')}<div class="pad stack menu">
     <div class="list">${row('exhibition','','store','Exhibition mode','Fast counter screen for busy stalls')}${row('go','search','search','Search product','Serial number, name or category')}${row('tab','bills','receipt','Sales history','All invoices')}</div>
-    <div class="list">${row('go','admin','edit','Admin · Product management','Add products, edit price, stock, image')}${row('tab','inventory','box','Inventory','Stock in, stock out, low stock')}${row('go','sync','cloud','Google Sheets sync','Simulated connection')}${row('go','rates','cash','Currencies & rates','Rates, and add your own currencies')}${row('go','sending','chat','WhatsApp & email sending',Backend.status.whatsapp||Backend.status.email?'Direct PDF sending is on':'Set up direct PDF sending')}</div>
+    <div class="list">${row('go','admin','edit','Admin · Product management','Add products, edit price, stock, image')}${row('tab','inventory','box','Inventory','Stock in, stock out, low stock')}${row('go','sync','cloud','Google Sheet sync',SheetSync.on()?(SheetSync.pending()?SheetSync.pending()+' bills waiting to send':'Connected'):'Not connected yet')}${row('go','rates','cash','Currencies & rates','Rates, and add your own currencies')}${row('go','sending','chat','WhatsApp & email sending',Backend.status.whatsapp||Backend.status.email?'Direct PDF sending is on':'Set up direct PDF sending')}</div>
     <div class="list">${row('go','accuracy','spark','Scanner accuracy test','Measure how often scans are right')}${row('go','about','layers','How the system works','Workflow, architecture and future roadmap')}${row('resetAsk','','reset','Clear all data','Remove all products, bills and stock history')}</div>
     <p class="hint" style="text-align:center">Prototype · data stays on this device</p>
   </div>`;
@@ -1712,12 +1790,22 @@ V.rates = () => {
   </div>`;
 };
 V.sync = () => {
-  const st=DB.settings;
-  return `${topbar('Google Sheets sync',{sub:'Simulated for the demo'})}<div class="pad stack">
-    <div class="card stack" style="gap:10px"><span class="eyebrow ok">${ic('cloud')} Connected (simulated)</span>
-      <dl class="facts"><div><dt>Spreadsheet</dt><dd style="font-size:14px">SLC_Inventory_2026</dd></div><div><dt>Last sync</dt><dd style="font-size:14px">${st.syncing?'Syncing…':ago(st.lastSync)}</dd></div><div><dt>Products sheet</dt><dd style="font-size:14px">${DB.products.length} rows</dd></div><div><dt>Sales sheet</dt><dd style="font-size:14px">${DB.sales.length} rows</dd></div></dl>
-      <button class="btn btn-primary" data-act="syncNow" ${st.syncing?'disabled':''}>${ic('refresh')} ${st.syncing?'Syncing…':'Sync now'}</button></div>
-    <div class="note info">${ic('info')}<span>In the live version, the product repository reads and writes this sheet: one row per Serial No. with name, category, price, stock and image link. Every confirmed bill appends a row to the Sales sheet.</span></div>
+  const st=DB.settings, c=Object.assign({},SheetSync.cfg(),S.cfgDraft||{}), on=SheetSync.on(), n=SheetSync.pending();
+  const unsentPics=DB.products.filter(p=>p.photo && (st.photoSent||{})[p.serial]!==shHash(p.photo)).length;
+  return `${topbar('Google Sheet sync',{sub:on?'Inventory, photos and bills':'Connect once'})}<div class="pad stack">
+    <div class="card stack" style="gap:10px"><span class="eyebrow ${on&&!SheetSync.error?'ok':'warn'}">${ic('cloud')} ${on?(SheetSync.error?'Connected, waiting':'Connected'):'Not connected'}</span>
+      <label class="fld"><span>Web app link (ends with /exec)</span><input id="sh-url" data-in="shUrl" value="${esc(c.url||'')}" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <label class="fld"><span>Secret code</span><input id="sh-token" data-in="shToken" type="password" value="${esc(c.token||'')}" placeholder="The code you set as SECRET" autocomplete="off" autocapitalize="off"></label>
+      <p class="err" id="sh-err" ${SheetSync.error&&on?'':'hidden'}>${esc(SheetSync.error||'')}</p>
+      <div class="row2"><button class="btn btn-primary" data-act="shConnect" ${S.shBusy?'disabled':''}>${ic('check')} ${S.shBusy==='connect'?'Checking…':(on?'Save & test':'Connect')}</button>${on?`<button class="btn" data-act="shOff">Disconnect</button>`:''}</div>
+    </div>
+    ${on?`<div class="card stack" style="gap:10px">
+      <dl class="facts"><div><dt>Last sync</dt><dd style="font-size:14px">${st.syncing?'Syncing…':(st.lastSync?ago(st.lastSync):'Never')}</dd></div><div><dt>Products</dt><dd style="font-size:14px">${DB.products.length} here</dd></div><div><dt>Bills waiting</dt><dd style="font-size:14px">${n}</dd></div><div><dt>Photos waiting</dt><dd style="font-size:14px">${unsentPics}</dd></div></dl>
+      <button class="btn btn-primary" data-act="shPush" ${st.syncing||S.shBusy?'disabled':''}>${ic('refresh')} ${st.syncing?'Sending…':'Send to the sheet now'}</button>
+      <button class="btn" data-act="shPull" ${st.syncing||S.shBusy?'disabled':''}>${ic('cloud')} ${S.shBusy==='pull'?'Loading from the sheet…':'Load products from the sheet'}</button>
+      <p class="hint">Send: bills, stock and new photos go to the sheet by themselves after every change. Load: use this on a new phone to bring in all products and photos. Products with the same number are replaced by the sheet's version.</p>
+    </div>`:''}
+    <div class="note info">${ic('info')}<span>Bills made without internet stay on this phone and are sent when the internet is back. Anyone with the link and code can read and change the sheet, so keep both private.</span></div>
   </div>`;
 };
 
@@ -1935,7 +2023,7 @@ const A = {
   payMethod(m){ DB.cart.payment=m; save(); render(); },
   async confirmBill(){
     const lines=Billing.lines(); if(!lines.length) return;
-    S.busy={steps:['Recording '+DB.cart.payment+' payment','Generating invoice','Updating stock','Syncing to Google Sheets (demo)'],idx:0}; render();
+    S.busy={steps:['Recording '+DB.cart.payment+' payment','Generating invoice','Updating stock','Saving the bill'],idx:0}; render();
     for(let i=1;i<=4;i++){ await wait(480); S.busy.idx=i; render(); }
     let sale; try{ sale=Billing.finalize(); }catch(e){ S.busy=null; render(); toast(e.message); return; }
     S.busy=null; S.stack=[]; S.tab = S.exh ? S.tab : 'bills'; S.view='invoice'; S.params={id:sale.no,fresh:true}; render();
@@ -2065,10 +2153,23 @@ const A = {
     }
   },
   syncNow(){ SheetSync.push(); render(); },
+  async shConnect(){
+    const d=Object.assign({},SheetSync.cfg(),S.cfgDraft||{});
+    if(!/^https:\/\/script\.google\.com\/macros\/s\/[^\s]+\/exec$/.test(d.url||'')){ SheetSync.error='The link should start with https://script.google.com/macros/s/ and end with /exec'; S.shBusy=null; render(); const e=$('#sh-err'); if(e) e.hidden=false; return; }
+    if(!d.token){ SheetSync.error='Type the secret code'; render(); const e=$('#sh-err'); if(e) e.hidden=false; return; }
+    const old=SheetCfg.get(); SheetCfg.set({url:d.url,token:d.token}); S.shBusy='connect'; SheetSync.error=''; render();
+    try{ await SheetSync.test(); S.cfgDraft=null; S.shBusy=null; toast('✓ Connected to your Google Sheet'); render(); SheetSync.push(); }
+    catch(e){ SheetCfg.set(old); S.shBusy=null; SheetSync.error=e.message; render(); const el=$('#sh-err'); if(el){ el.textContent=e.message; el.hidden=false; } }
+  },
+  shOff(){ SheetCfg.set({}); S.cfgDraft=null; SheetSync.error=''; render(); toast('Disconnected. Data stays on this phone.'); },
+  async shPush(){ toast('Sending…'); await SheetSync.push(true); render(); toast(SheetSync.error?('Not sent: '+SheetSync.error):'✓ Sent to the sheet'); },
+  async shPull(){ S.shBusy='pull'; render(); try{ const n=await SheetSync.pull(); S.shBusy=null; render(); toast(`✓ Loaded ${n} products`); }catch(e){ S.shBusy=null; SheetSync.error=e.message; render(); toast('Could not load: '+e.message); } },
   resetAsk(){ S.sheet={type:'reset'}; render(); },
   resetDo(){ Store.clear(); DB=seedDB(); FPCache.clear(); Matcher.reset(); Matcher.ready(); save(); S.sheet=null; S.stack=[]; S.tab='home'; S.view='home'; S.exh=false; startScan(); render(); toast('All data cleared'); },
 };
 const IN = {
+  shUrl(t){ S.cfgDraft=Object.assign(S.cfgDraft||{},{url:t.value.trim()}); },
+  shToken(t){ S.cfgDraft=Object.assign(S.cfgDraft||{},{token:t.value.trim()}); },
   disc(t){ let v=Math.max(0,parseFloat(t.value)||0); if(DB.cart.discType==='pct') v=Math.min(v,100); DB.cart.discVal=v; save(); $('#totals').innerHTML=totalsHTML(); document.querySelectorAll('.chip.on').forEach(c=>c.classList.remove('on')); },
   customer(t){ DB.cart.customer=t.value; save(); },
   phone(t){ DB.cart.phone=t.value; save(); },
