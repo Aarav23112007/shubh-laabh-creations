@@ -787,7 +787,7 @@ if(!DB.cart.currency) DB.cart.currency = DB.cart.country==='China' ? 'CNY' : 'IN
 Object.assign(CURRENCIES, DB.settings.customCurrencies||{});   // currencies added in More → Currencies & rates
 Object.assign(COUNTRIES, DB.settings.customCountries||{});
 if(!DB.cart.country) DB.cart.country='India';
-const save = () => Store.save(DB);
+const save = () => { Store.save(DB); if(typeof Cloud!=='undefined' && Cloud && Cloud.settingsDirty) Cloud.settingsDirty(); };
 
 /* ---------- ProductRepo ---------- */
 const imgCache = {};
@@ -1057,9 +1057,9 @@ const Matcher = {
     let thumb; try{ thumb=await downscale(photo,240); }catch(e){ return null; }
     p.refImgs=(p.refImgs||[]).concat([thumb]).slice(-5);
     if(feat) p.refs=(p.refs||[]).concat([feat]).slice(-5);
-    save(); await this.indexProduct(p); return thumb;
+    save(); Cloud.saveRefs(p); await this.indexProduct(p); return thumb;
   },
-  unlearn(serial,thumb){ const p=Products.get(serial); if(!p||!thumb) return; const i=(p.refImgs||[]).lastIndexOf(thumb); if(i>=0){ p.refImgs.splice(i,1); save(); this.indexProduct(p); } }
+  unlearn(serial,thumb){ const p=Products.get(serial); if(!p||!thumb) return; const i=(p.refImgs||[]).lastIndexOf(thumb); if(i>=0){ p.refImgs.splice(i,1); save(); Cloud.saveRefs(p); this.indexProduct(p); } }
 };
 
 /* ---------- Recognition ----------
@@ -1125,7 +1125,7 @@ const Billing = {
     DB.seq++;
     const sale={no:invoiceNo(DB.seq),date:new Date().toISOString(),customer:DB.cart.customer.trim()||'Walk-in Customer',phone:DB.cart.phone.trim(),email:(DB.cart.email||'').trim(),items,subtotal:sub,discount:disc,discLabel:DB.cart.discType==='pct'&&DB.cart.discVal?DB.cart.discVal+'%':'',total:Math.round((sub-disc)*100)/100,payment:DB.cart.payment,channel:'Exhibition',country:DB.cart.country,currency:DB.cart.currency||'INR',fx:rates()[DB.cart.currency||'INR']||1,stockChanges:[]};
     lines.forEach(l=>{ const from=l.p.stock; l.p.stock-=l.qty; sale.stockChanges.push({serial:l.p.serial,name:l.p.name,from,to:l.p.stock}); Inventory.log('sale',l.p.serial,-l.qty,from,l.p.stock,sale.no); });
-    DB.sales.unshift(sale); DB.cart=emptyCart(); save(); SheetSync.push();
+    DB.sales.unshift(sale); DB.cart=emptyCart(); save(); SheetSync.push(); Cloud.recordSale(sale);
     return sale;
   }
 };
@@ -1133,7 +1133,7 @@ const Billing = {
 /* ---------- Inventory ---------- */
 const Inventory = {
   log(type,serial,delta,from,to,note){ DB.log.unshift({t:Date.now(),type,serial,delta,from,to,note}); DB.log=DB.log.slice(0,80); },
-  adjust(serial,delta,note){ const p=Products.get(serial); const from=p.stock; p.stock=Math.max(0,from+delta); this.log(delta>=0?'in':'out',serial,p.stock-from,from,p.stock,note); save(); SheetSync.push(); }
+  adjust(serial,delta,note){ const p=Products.get(serial); const from=p.stock; p.stock=Math.max(0,from+delta); this.log(delta>=0?'in':'out',serial,p.stock-from,from,p.stock,note); save(); SheetSync.push(); Cloud.stockDelta(serial,p.stock-from); }
 };
 
 /* ---------- Google Sheets sync (REAL: talks to the Apps Script web app) ---------- */
@@ -1219,6 +1219,163 @@ const SheetSync = {
 addEventListener('online',()=>SheetSync.push());
 setTimeout(()=>SheetSync.push(),4000);
 
+/* ---------- Cloud (Firebase): sign-in, products + photos + bills shared by every device, works offline ----------
+   Firestore keeps a copy on each phone. Bills and stock changes made offline are sent when the internet is back.
+   Stock changes are sent as "minus 2", never "set to 7", so two phones selling at once do not overwrite each other. */
+const FIREBASE_VERSION='13.4.0';
+const FIREBASE_CONFIG={ apiKey:'AIzaSyCFEHN_h_eTzggXkqUIKgmidJNZZyASo3o', authDomain:'shubh-laabh-creations.firebaseapp.com', projectId:'shubh-laabh-creations', messagingSenderId:'628185392238', appId:'1:628185392238:web:5d7e289ca21ed1e9e5b27f' };
+const saleId = n => String(n).replace(/\//g,'-');
+var Cloud = (function(){
+  let last=null; try{ last=JSON.parse(localStorage.getItem('slc-cloud-last')||'null'); }catch(e){}
+  const CL = {
+    fb:null, app:null, auth:null, db:null, sdkOk:false,
+    state: last ? 'ready' : 'loading',            // loading | signedOut | noRole | needSetup | ready | error
+    user: last ? {email:last.email} : null, role: last ? last.role : null,
+    error:'', note:'', busy:false, draftEmail:'', unsub:[], team:[],
+    cloudSerials:new Set(), cloudSales:new Set(), got:{p:false,s:false}, migrated:false, settingsReady:false, lastSettings:'', _t:{},
+    email(){ return ((CL.user && CL.user.email)||'').toLowerCase(); },
+    isOwner(){ return CL.role==='owner'; },
+    gated(){ return CL.state!=='ready'; },
+    live(){ return !!(CL.sdkOk && CL.db && CL.state==='ready' && CL.user && CL.fb); },
+    soft(){ clearTimeout(CL._r); CL._r=setTimeout(()=>{
+      if(CL.gated()){ render(); return; }
+      const ae=document.activeElement, typing=ae && /INPUT|TEXTAREA|SELECT/.test(ae.tagName);
+      if(['home','inventory','bills','more','account','admin'].includes(S.view) && !S.sheet && !S.busy && !typing) render();
+    },250); },
+    nice(e){ const c=(e&&e.code)||'';
+      const m={'auth/invalid-credential':'Wrong email or password','auth/wrong-password':'Wrong email or password','auth/user-not-found':'Wrong email or password','auth/invalid-email':'That email does not look right',
+        'auth/too-many-requests':'Too many tries. Wait a few minutes, or use Forgot password.','auth/network-request-failed':'No internet. Signing in needs internet the first time on each phone.','auth/user-disabled':'This login has been switched off',
+        'auth/operation-not-allowed':'Email/Password sign-in is not switched on in Firebase','auth/invalid-api-key':'App setup problem: the Firebase key in the app is wrong','auth/api-key-not-valid.-please-pass-a-valid-api-key.':'App setup problem: the Firebase key in the app is wrong',
+        'permission-denied':'The database rules are not set yet, or this login has no access.','unavailable':'No internet right now'};
+      return m[c] || (e && e.message) || 'Something went wrong'; },
+    async load(){
+      if(window.__fbOverride) return window.__fbOverride;
+      const base='https://www.gstatic.com/firebasejs/'+FIREBASE_VERSION+'/';
+      const [a,au,fs]=await Promise.all([import(base+'firebase-app.js'),import(base+'firebase-auth.js'),import(base+'firebase-firestore.js')]);
+      return Object.assign({},a,au,fs);
+    },
+    async init(){
+      try{
+        const f=await CL.load(); CL.fb=f;
+        CL.app=f.initializeApp(FIREBASE_CONFIG);
+        try{ CL.db=f.initializeFirestore(CL.app,{localCache:f.persistentLocalCache({tabManager:f.persistentMultipleTabManager()})}); }
+        catch(e){ CL.db=f.initializeFirestore(CL.app,{}); }
+        CL.auth=f.getAuth(CL.app); CL.sdkOk=true;
+        f.onAuthStateChanged(CL.auth,u=>CL.onUser(u));
+      }catch(e){
+        console.warn('Cloud unavailable',e); CL.sdkOk=false;
+        if(CL.state==='loading'){ CL.state='error'; CL.error='Could not open the sign-in service. Connect to the internet once, then try again.'; render(); }
+      }
+    },
+    async onUser(u){
+      CL.detach();
+      if(!u){ CL.user=null; CL.role=null; CL.team=[]; try{ localStorage.removeItem('slc-cloud-last'); }catch(e){} CL.state='signedOut'; render(); return; }
+      CL.user=u; CL.busy=false; await CL.checkRole();
+    },
+    async checkRole(){
+      const f=CL.fb, em=CL.email();
+      try{
+        const r=await f.getDoc(f.doc(CL.db,'roles',em));
+        if(r.exists()){ CL.role=r.data().role==='owner'?'owner':'staff'; return CL.enter(); }
+        const st=await f.getDoc(f.doc(CL.db,'config','setup'));
+        CL.role=null; CL.error=''; CL.state=st.exists()?'noRole':'needSetup'; render();
+      }catch(e){
+        if(last && last.email===em){ CL.role=last.role; return CL.enter(); }      // offline: carry on with what this phone already knows
+        CL.state='error'; CL.error=CL.nice(e); render();
+      }
+    },
+    enter(){
+      CL.state='ready'; CL.error='';
+      try{ localStorage.setItem('slc-cloud-last',JSON.stringify({email:CL.email(),role:CL.role})); }catch(e){}
+      CL.listen(); render();
+    },
+    detach(){ CL.unsub.forEach(u=>{ try{ u(); }catch(e){} }); CL.unsub=[]; CL.got={p:false,s:false}; CL.settingsReady=false; },
+    listen(){
+      CL.detach(); const f=CL.fb, db=CL.db;
+      const err=e=>{ console.warn('cloud',e); };
+      CL.unsub.push(f.onSnapshot(f.collection(db,'products'),s=>CL.onProducts(s),err));
+      CL.unsub.push(f.onSnapshot(f.query(f.collection(db,'sales'),f.orderBy('date','desc'),f.limit(500)),s=>CL.onSales(s),err));
+      CL.unsub.push(f.onSnapshot(f.doc(db,'settings','shop'),s=>CL.onSettings(s),err));
+      CL.unsub.push(f.onSnapshot(f.doc(db,'roles',CL.email()),s=>CL.onMyRole(s),err));
+      if(CL.isOwner()) CL.unsub.push(f.onSnapshot(f.collection(db,'roles'),s=>{ CL.team=s.docs.map(d=>({email:d.id,role:d.data().role})).sort((a,b)=>a.email.localeCompare(b.email)); if(S.view==='account') CL.soft(); },err));
+    },
+    resync(){ if(!CL.live()) return; CL.cloudSerials.clear(); CL.listen(); },
+    onMyRole(s){
+      if(!s.exists()){ if(!s.metadata.fromCache){ CL.role=null; CL.detach(); CL.state='noRole'; try{ localStorage.removeItem('slc-cloud-last'); }catch(e){} render(); } return; }
+      const r=s.data().role==='owner'?'owner':'staff';
+      if(r!==CL.role){ CL.role=r; try{ localStorage.setItem('slc-cloud-last',JSON.stringify({email:CL.email(),role:r})); }catch(e){} CL.listen(); CL.soft(); }
+    },
+    onProducts(s){
+      const reindex=[];
+      s.docChanges().forEach(ch=>{
+        const serial=parseInt(ch.doc.id,10); if(!(serial>0)) return;
+        if(ch.type==='removed'){ CL.cloudSerials.delete(serial); DB.products=DB.products.filter(p=>p.serial!==serial); try{ delete Matcher.idx[serial]; }catch(e){} return; }
+        CL.cloudSerials.add(serial);
+        const d=ch.doc.data(); let p=Products.get(serial);
+        if(!p){ p={serial,art:DEFAULT_ART[d.category]||DEFAULT_ART['Art & Craft'],group:'',refs:[]}; DB.products.push(p); }
+        const changedPics=(d.photo||null)!==(p.photo||null) || JSON.stringify(d.refImgs||[])!==JSON.stringify(p.refImgs||[]);
+        const price=+d.price||0;
+        Object.assign(p,{name:d.name||'',category:d.category,price,priceIntl:(d.priceIntl==null?intlDefault(price):+d.priceIntl),stock:Math.max(0,+d.stock||0),size:d.size||'',description:d.description||'',group:d.group||'',photo:d.photo||null,refImgs:Array.isArray(d.refImgs)?d.refImgs:[]});
+        if(changedPics) reindex.push(p);
+      });
+      DB.products.sort((a,b)=>a.serial-b.serial); save();
+      reindex.forEach(p=>{ CL._idx=(CL._idx||Promise.resolve()).then(()=>Matcher.indexProduct(p)).catch(()=>{}); });
+      if(!s.metadata.fromCache) CL.got.p=true; CL.maybeMigrate(); CL.soft();
+    },
+    onSales(s){
+      const byNo=new Map(DB.sales.map(x=>[x.no,x]));
+      s.docs.forEach(d=>{ const x=d.data(); if(!x||!x.no) return; const old=byNo.get(x.no); if(old&&old.sheetOk) x.sheetOk=true; byNo.set(x.no,x); CL.cloudSales.add(x.no); });
+      DB.sales=[...byNo.values()].sort((a,b)=>String(b.date).localeCompare(String(a.date)));
+      const mx=Math.max(0,...DB.sales.map(x=>parseInt(String(x.no).split('/').pop(),10)||0)); if(mx>DB.seq) DB.seq=mx;
+      save(); if(!s.metadata.fromCache) CL.got.s=true; CL.maybeMigrate(); CL.soft();
+      try{ SheetSync.push(); }catch(e){}
+    },
+    settingsKey(){ const t=DB.settings; return JSON.stringify([t.intlBase||'',t.rates||{},t.customCurrencies||{},t.customCountries||{}]); },
+    onSettings(s){
+      if(!s.exists()){ if(!s.metadata.fromCache){ CL.settingsReady=true; CL.lastSettings=''; CL.settingsDirty(); } return; }
+      const d=s.data();
+      if(d.intlBase) DB.settings.intlBase=d.intlBase;
+      if(d.rates) DB.settings.rates=d.rates;
+      DB.settings.customCurrencies=d.customCurrencies||{}; DB.settings.customCountries=d.customCountries||{};
+      Object.assign(CURRENCIES,DB.settings.customCurrencies); Object.assign(COUNTRIES,DB.settings.customCountries);
+      CL.settingsReady=true; CL.lastSettings=CL.settingsKey(); save(); CL.soft();
+    },
+    settingsDirty(){
+      if(!CL.live() || !CL.isOwner() || !CL.settingsReady) return;
+      clearTimeout(CL._st);
+      CL._st=setTimeout(()=>{ const k=CL.settingsKey(); if(k===CL.lastSettings) return; CL.lastSettings=k; const t=DB.settings;
+        CL.w(CL.fb.setDoc(CL.fb.doc(CL.db,'settings','shop'),JSON.parse(JSON.stringify({intlBase:t.intlBase||'USD',rates:t.rates||{},customCurrencies:t.customCurrencies||{},customCountries:t.customCountries||{},updatedAt:Date.now()}))),'settings'); },800);
+    },
+    maybeMigrate(){
+      if(CL.migrated || !CL.got.p || !CL.got.s || !CL.isOwner()) return; CL.migrated=true;
+      if(CL.cloudSerials.size===0 && DB.products.length && navigator.onLine){ CL.uploadLocal().then(n=>{ if(n) toast('✓ Your products and bills are now in the cloud'); }).catch(e=>toast(CL.nice(e))); }
+    },
+    async uploadLocal(){
+      if(!CL.live() || !CL.isOwner()) return 0; const f=CL.fb; let n=0;
+      const prods=DB.products.filter(p=>!CL.cloudSerials.has(p.serial));
+      for(let i=0;i<prods.length;i+=10){ const b=f.writeBatch(CL.db); prods.slice(i,i+10).forEach(p=>{ b.set(CL.ref(p.serial),CL.clean(p)); n++; }); await b.commit(); }
+      const sales=DB.sales.filter(x=>!CL.cloudSales.has(x.no));
+      for(let i=0;i<sales.length;i+=10){ const b=f.writeBatch(CL.db); sales.slice(i,i+10).forEach(x=>{ const d=JSON.parse(JSON.stringify(x)); delete d.sheetOk; b.set(f.doc(CL.db,'sales',saleId(x.no)),d); n++; }); await b.commit(); }
+      return n;
+    },
+    clean(p){ return JSON.parse(JSON.stringify({name:p.name,category:p.category,price:p.price,priceIntl:(p.priceIntl==null?null:p.priceIntl),stock:p.stock,size:p.size||'',description:p.description||'',group:p.group||'',photo:p.photo||null,refImgs:(p.refImgs||[]).slice(0,5),updatedAt:Date.now()})); },
+    ref(serial){ return CL.fb.doc(CL.db,'products',ser(serial)); },
+    w(promise,what){ Promise.resolve(promise).catch(e=>{ console.warn(what,e); toast(e && e.code==='permission-denied' ? 'Your login is not allowed to do that' : 'Could not save to the cloud'); }); },
+    saveProduct(p){ if(!CL.live()||!p) return; CL.w(CL.fb.setDoc(CL.ref(p.serial),CL.clean(p)),'product'); },
+    saveRefs(p){ if(!CL.live()||!p) return; CL.w(CL.fb.updateDoc(CL.ref(p.serial),{refImgs:(p.refImgs||[]).slice(0,5),updatedAt:Date.now()}),'photos'); },
+    stockDelta(serial,d){ if(!CL.live()||!d) return; CL.w(CL.fb.updateDoc(CL.ref(serial),{stock:CL.fb.increment(d),updatedAt:Date.now()}),'stock'); },
+    recordSale(sale){
+      if(!CL.live()) return; const f=CL.fb, b=f.writeBatch(CL.db); const d=JSON.parse(JSON.stringify(sale)); delete d.sheetOk;
+      b.set(f.doc(CL.db,'sales',saleId(sale.no)),d);
+      (sale.stockChanges||[]).forEach(c=>{ const x=c.to-c.from; if(x) b.update(CL.ref(c.serial),{stock:f.increment(x),updatedAt:Date.now()}); });
+      CL.w(b.commit(),'bill');
+    },
+    touchSale(s){ if(!CL.live()||!s) return; clearTimeout(CL._t[s.no]);
+      CL._t[s.no]=setTimeout(()=>{ CL.w(CL.fb.updateDoc(CL.fb.doc(CL.db,'sales',saleId(s.no)),JSON.parse(JSON.stringify({shared:s.shared||{},phone:s.phone||'',email:s.email||''}))),'bill'); },900); }
+  };
+  return CL;
+})();
+
 /* ---------- Metrics ---------- */
 const Metrics = {
   today(){ const list=DB.sales.filter(s=>isToday(s.date)); return {list, sales:sum(list,saleINR), bills:list.length, qty:sum(list,s=>sum(s.items,i=>i.qty))}; },
@@ -1247,7 +1404,7 @@ function topbar(title,{sub='',back:showBack}={}){
   const b = showBack ?? (S.stack.length>0 || (S.view==='scan' && S.scan.phase!=='camera'));
   return `<header class="top"><div class="top-row">${b?`<button class="icon-btn" data-act="back" aria-label="Back">${ic('back')}</button>`:''}<div class="top-title"><h1>${esc(title)}</h1>${sub?`<p>${esc(sub)}</p>`:''}</div>${EMBLEM}</div></header>`;
 }
-function syncPill(){ const st=DB.settings, on=SheetSync.on(), n=SheetSync.pending(); return `<span class="pill-dark"><span class="dot ${st.syncing?'busy':''}"></span>${!on?'Google Sheet not connected':st.syncing?'Syncing to Google Sheet…':SheetSync.error?'Sheet: waiting ('+(n||'')+(n?' bills ':'')+'pending)':'Google Sheet synced '+ago(st.lastSync)}</span>`; }
+function syncPill(){ if(Cloud.state==='ready' && Cloud.user) return `<span class="pill-dark"><span class="dot ${navigator.onLine?'':'busy'}"></span>${esc(Cloud.email().split('@')[0])} · ${Cloud.isOwner()?'owner':'staff'}${navigator.onLine?'':' · offline'}</span>`; const st=DB.settings, on=SheetSync.on(), n=SheetSync.pending(); return `<span class="pill-dark"><span class="dot ${st.syncing?'busy':''}"></span>${!on?'Google Sheet not connected':st.syncing?'Syncing to Google Sheet…':SheetSync.error?'Sheet: waiting ('+(n||'')+(n?' bills ':'')+'pending)':'Google Sheet synced '+ago(st.lastSync)}</span>`; }
 function brandHeader(){
   return `<header class="brand"><div class="brand-row">${EMBLEM}<div><div class="brand-name">SHUBH LAABH CREATIONS</div><div class="brand-sub">Handmade Wall Hanging &amp; Decorative Products</div></div></div>
   <div class="brand-meta"><span class="pill-dark">${ic('store')}${esc(EVENT)}</span>${syncPill()}</div></header><div class="toran-edge"></div>`;
@@ -1537,7 +1694,7 @@ function sendBtns(s){
     <button class="btn btn-ghost" data-act="sendPdf">${ic('file')} Share or save PDF</button>
     <p class="hint">${!ph?'Add the customer’s WhatsApp number. ':B.whatsapp?`<b>WhatsApp:</b> the PDF goes straight to <b>+${ph}</b>, then their chat opens. `:`<b>WhatsApp:</b> direct sending is not set up, so the chat with <b>+${ph}</b> opens and the PDF is saved for you to attach. `}${!em?'Add an email address to email the PDF. ':B.email?'<b>Email:</b> the PDF is emailed straight to the customer. ':'<b>Email:</b> direct sending is not set up. '}${B.whatsapp&&B.email?'':'<button class="link" data-act="go" data-arg="sending">Set up direct sending</button>'}</p></div>`;
 }
-function markShared(kind){ const s=curSale(); if(!s) return; s.shared=Object.assign({},s.shared,{[kind]:Date.now()}); save(); const t=$('#sentTag'); if(t) t.innerHTML=sentTag(s); }
+function markShared(kind){ const s=curSale(); if(!s) return; s.shared=Object.assign({},s.shared,{[kind]:Date.now()}); save(); Cloud.touchSale(s); const t=$('#sentTag'); if(t) t.innerHTML=sentTag(s); }
 
 /* ---------- PDF cache: built when the invoice opens, so WhatsApp can use it instantly ---------- */
 const pdfName = s => `Invoice-${s.no.replace(/\//g,'-')}.pdf`;
@@ -1667,12 +1824,13 @@ V.product = () => {
 };
 
 V.more = () => {
+  const own=x=>Cloud.isOwner()?x:'';
   const row=(act,arg,icon,t,sub)=>`<button class="list-row" data-act="${act}" data-arg="${arg}">${ic(icon)}<span class="lr-main"><b>${t}</b><small>${sub}</small></span>${ic('chev','chev')}</button>`;
   return `${topbar('More')}<div class="pad stack menu">
-    <div class="list">${row('exhibition','','store','Exhibition mode','Fast counter screen for busy stalls')}${row('go','search','search','Search product','Serial number, name or category')}${row('tab','bills','receipt','Sales history','All invoices')}</div>
-    <div class="list">${row('go','admin','edit','Admin · Product management','Add products, edit price, stock, image')}${row('tab','inventory','box','Inventory','Stock in, stock out, low stock')}${row('go','sync','cloud','Google Sheet sync',SheetSync.on()?(SheetSync.pending()?SheetSync.pending()+' bills waiting to send':'Connected'):'Not connected yet')}${row('go','rates','cash','Currencies & rates','Rates, and add your own currencies')}${row('go','sending','chat','WhatsApp & email sending',Backend.status.whatsapp||Backend.status.email?'Direct PDF sending is on':'Set up direct PDF sending')}</div>
-    <div class="list">${row('go','accuracy','spark','Scanner accuracy test','Measure how often scans are right')}${row('go','about','layers','How the system works','Workflow, architecture and future roadmap')}${row('resetAsk','','reset','Clear all data','Remove all products, bills and stock history')}</div>
-    <p class="hint" style="text-align:center">Prototype · data stays on this device</p>
+    <div class="list">${row('go','account','user','Account & team',esc(Cloud.email()||'Not signed in')+(Cloud.role?' · '+Cloud.role:''))}${row('exhibition','','store','Exhibition mode','Fast counter screen for busy stalls')}${row('go','search','search','Search product','Serial number, name or category')}${row('tab','bills','receipt','Sales history','All invoices')}</div>
+    <div class="list">${own(row('go','admin','edit','Admin · Product management','Add products, edit price, stock, image'))}${row('tab','inventory','box','Inventory','Stock in, stock out, low stock')}${own(row('go','sync','cloud','Google Sheet copy',SheetSync.on()?(SheetSync.pending()?SheetSync.pending()+' bills waiting to send':'Connected'):'Optional report copy, not connected'))}${own(row('go','rates','cash','Currencies & rates','Rates, and add your own currencies'))}${row('go','sending','chat','WhatsApp & email sending',Backend.status.whatsapp||Backend.status.email?'Direct PDF sending is on':'Set up direct PDF sending')}</div>
+    <div class="list">${own(row('go','accuracy','spark','Scanner accuracy test','Measure how often scans are right'))}${row('go','about','layers','How the system works','Workflow, architecture and future roadmap')}${own(row('resetAsk','','reset','Clear data on this phone','Reloads everything from the cloud'))}</div>
+    <p class="hint" style="text-align:center">Products, photos and bills are shared by every signed-in phone</p>
   </div>`;
 };
 
@@ -1809,6 +1967,40 @@ V.sync = () => {
   </div>`;
 };
 
+function loginHTML(){
+  const C0=Cloud, st=C0.state; let body='';
+  const logo=`<img src="icon-192.png" width="84" height="84" alt="" style="border-radius:50%;display:block;margin:0 auto 4px">`;
+  const err=C0.error?`<p class="err">${esc(C0.error)}</p>`:'';
+  if(st==='loading') body=`<p class="hint" style="text-align:center">Opening…</p>`;
+  else if(st==='signedOut') body=`<label class="fld"><span>Email</span><input id="lg-email" type="email" inputmode="email" autocomplete="username" autocapitalize="off" spellcheck="false" value="${esc(C0.draftEmail||'')}"></label>
+    <label class="fld"><span>Password</span><input id="lg-pass" type="password" autocomplete="current-password"></label>${err}${C0.note?`<p class="hint">${esc(C0.note)}</p>`:''}
+    <button class="btn btn-primary" data-act="cloudLogin" ${C0.busy?'disabled':''}>${C0.busy?'Signing in…':'Sign in'}</button>
+    <button type="button" class="link" data-act="cloudReset" style="align-self:center">Forgot password?</button>`;
+  else if(st==='needSetup') body=`<div class="card stack"><b>First-time setup</b><p class="muted">You are signed in as <b>${esc(C0.email())}</b>. Make this login the owner of the shop. Do this once. Owners can add products, change prices and add staff.</p>
+    ${err}<button class="btn btn-primary" data-act="cloudClaim" ${C0.busy?'disabled':''}>${C0.busy?'Setting up…':'Make me the owner'}</button></div><button class="link" data-act="cloudOut" style="align-self:center">Sign out</button>`;
+  else if(st==='noRole') body=`<div class="card stack"><b>No access yet</b><p class="muted"><b>${esc(C0.email())}</b> has not been added to the shop. Ask the owner to add this email in <b>More → Account &amp; team</b>, then sign in again.</p></div><button class="btn" data-act="cloudOut">Sign out</button>`;
+  else body=`<div class="card stack"><b>Could not continue</b>${err||'<p class="err">Something went wrong.</p>'}</div><button class="btn btn-primary" data-act="cloudRetry">Try again</button><button class="link" data-act="cloudOut" style="align-self:center">Sign out</button>`;
+  return `<main id="main"><div class="pad stack" style="max-width:420px;margin:0 auto;padding-top:48px">${logo}<h1 class="h-display" style="text-align:center">Shubh Laabh Creations</h1><p class="muted" style="text-align:center;margin-top:-6px">Sign in to bill, scan and manage stock</p>${body}</div></main>`;
+}
+V.account = () => {
+  const C0=Cloud, own=C0.isOwner(), em=C0.email();
+  const local=DB.products.filter(p=>!C0.cloudSerials.has(p.serial)).length+DB.sales.filter(x=>!C0.cloudSales.has(x.no)).length;
+  const team=own?`<div class="card stack" style="gap:10px"><b>Team</b>
+      ${C0.team.length?C0.team.map(m=>`<div class="row2" style="align-items:center"><span style="font-size:14px;word-break:break-all">${esc(m.email)}</span>
+        <span style="display:flex;gap:8px;justify-content:flex-end"><select data-ch="teamRole" data-email="${esc(m.email)}" ${m.email===em?'disabled':''}><option value="staff" ${m.role!=='owner'?'selected':''}>Staff</option><option value="owner" ${m.role==='owner'?'selected':''}>Owner</option></select>
+        ${m.email===em?'':`<button type="button" class="link" data-act="teamRemove" data-arg="${esc(m.email)}">Remove</button>`}</span></div>`).join(''):'<p class="hint">Loading…</p>'}
+      <hr style="border:0;border-top:1px solid var(--line,#e6e0d8);margin:4px 0">
+      <label class="fld"><span>Add a person (their login email)</span><input id="tm-email" type="email" inputmode="email" autocapitalize="off" placeholder="name@gmail.com"></label>
+      <label class="fld"><span>Role</span><select id="tm-role"><option value="staff">Staff: scan, bill, stock in/out</option><option value="owner">Owner: also products, prices, team</option></select></label>
+      <button class="btn btn-primary" data-act="teamAdd">${ic('plus')} Add person</button>
+      <p class="hint">First create their login in Firebase → Authentication → Users → Add user. Then add the same email here. To remove access, tap Remove here and delete the login in Firebase.</p></div>`:'';
+  const up=own&&local?`<div class="card stack" style="gap:8px"><b>${local} item${local>1?'s':''} only on this phone</b><p class="hint">Products or bills made on this phone that are not in the cloud yet.</p><button class="btn" data-act="cloudUpload" ${navigator.onLine?'':'disabled'}>${ic('cloud')} Upload to the cloud</button></div>`:'';
+  return `${topbar('Account & team')}<div class="pad stack">
+    <div class="card stack" style="gap:10px"><dl class="facts"><div><dt>Signed in</dt><dd style="font-size:14px;word-break:break-all">${esc(em)}</dd></div><div><dt>Role</dt><dd style="font-size:14px">${own?'Owner':'Staff'}</dd></div><div><dt>Connection</dt><dd style="font-size:14px">${navigator.onLine?'Online':'Offline: saving on this phone'}</dd></div><div><dt>Products in cloud</dt><dd style="font-size:14px">${C0.cloudSerials.size}</dd></div></dl>
+      <button class="btn" data-act="cloudOut">Sign out</button></div>${team}${up}
+  </div>`;
+};
+
 V.about = () => {
   const steps=[['camera','Photo','Seller photographs the product. No serial number needs to be visible.'],['spark','AI product detection','Photo is compared with catalogue images (simulated in this demo).'],['search','Possible product match','Top match with confidence, or a shortlist when products look alike.'],['hand','Seller confirmation','The seller confirms or picks the right product. AI never decides alone.',1],['plus','Quantity','AI may suggest a count; the seller adjusts it.',1],['receipt','Bill','Multiple products, % or ₹ discount, full review screen.',1],['cash','Payment','Cash, UPI, Card or Other is recorded on the invoice.'],['box','Automatic stock update','Stock is deducted only after Confirm & Generate Bill.']];
   const future=[['Real AI image recognition','Recognition service'],['Google Sheets','Product repository'],['Cloud database','Product repository'],['Real product photo library','Catalogue images'],['PDF invoices','Invoice service'],['WhatsApp invoice sharing','Invoice service'],['UPI payment integration','Payment service'],['Multi-user access','Staff logins per stall'],['Online orders','New sales channel'],['International orders','Currency and shipping']];
@@ -1882,6 +2074,7 @@ function navHTML(){
 }
 
 function render(){
+  if(Cloud.gated()){ if(Cam.stream) Cam.stop(); $('#app').innerHTML=loginHTML(); return; }
   const main=$('#main'); const st=main?main.scrollTop:0;
   const key=S.view+'|'+(S.params.id??'')+'|'+(S.view==='scan'?S.scan.phase:'');
   $('#app').innerHTML = `<main id="main">${(V[S.view]||V.home)()}</main>${cartBar()}${navHTML()}${sheetHTML()}${busyHTML()}`;
@@ -1982,6 +2175,36 @@ function toQty(serial,prev){
   const p=Products.get(serial); const max=p.stock-Billing.qtyOf(serial); S.scan.selected=serial; S.scan.prev=prev; S.scan.qty=Math.max(1,Math.min(S.scan.suggested||1, Math.max(max,1))); S.scan.phase='qty'; render(); }
 
 const A = {
+  async cloudLogin(){
+    const e=($('#lg-email').value||'').trim().toLowerCase(), p=$('#lg-pass').value||'';
+    Cloud.draftEmail=e; Cloud.note='';
+    if(!e||!p){ Cloud.error='Type your email and password'; render(); return; }
+    if(!Cloud.fb||!Cloud.auth){ Cloud.error='Still loading. Wait a moment and try again.'; render(); return; }
+    Cloud.busy=true; Cloud.error=''; render();
+    try{ await Cloud.fb.signInWithEmailAndPassword(Cloud.auth,e,p); Cloud.busy=false; }
+    catch(err){ Cloud.busy=false; Cloud.error=Cloud.nice(err); render(); }
+  },
+  async cloudReset(){
+    const e=($('#lg-email').value||'').trim().toLowerCase(); Cloud.draftEmail=e;
+    if(!e){ Cloud.error='Type your email first, then tap Forgot password'; render(); return; }
+    if(!Cloud.fb||!Cloud.auth){ Cloud.error='Still loading. Try again in a moment.'; render(); return; }
+    try{ await Cloud.fb.sendPasswordResetEmail(Cloud.auth,e); Cloud.error=''; Cloud.note='If that email has a login, a reset email is on its way. Check spam too.'; }catch(err){ Cloud.error=Cloud.nice(err); Cloud.note=''; }
+    render();
+  },
+  async cloudClaim(){
+    const f=Cloud.fb; Cloud.busy=true; Cloud.error=''; render();
+    try{ const b=f.writeBatch(Cloud.db); b.set(f.doc(Cloud.db,'roles',Cloud.email()),{role:'owner',email:Cloud.email(),at:Date.now()}); b.set(f.doc(Cloud.db,'config','setup'),{by:Cloud.email(),at:Date.now()}); await b.commit(); Cloud.role='owner'; Cloud.busy=false; Cloud.enter(); }
+    catch(err){ Cloud.busy=false; Cloud.error=Cloud.nice(err); render(); }
+  },
+  async cloudOut(){ try{ if(Cloud.fb&&Cloud.auth) await Cloud.fb.signOut(Cloud.auth); }catch(e){} Cloud.detach(); Cloud.user=null; Cloud.role=null; try{ localStorage.removeItem('slc-cloud-last'); }catch(e){} Cloud.state='signedOut'; Cloud.error=''; Cloud.note=''; S.stack=[]; S.tab='home'; S.view='home'; render(); },
+  cloudRetry(){ Cloud.error=''; if(Cloud.sdkOk&&Cloud.user){ Cloud.state='loading'; render(); Cloud.checkRole(); } else if(Cloud.sdkOk){ Cloud.state='signedOut'; render(); } else { Cloud.state='loading'; render(); Cloud.init(); } },
+  async cloudUpload(){ toast('Uploading…'); try{ const n=await Cloud.uploadLocal(); toast(n?`✓ Uploaded ${n} items`:'Nothing to upload'); }catch(e){ toast(Cloud.nice(e)); } render(); },
+  teamAdd(){
+    const em=($('#tm-email').value||'').trim().toLowerCase(), role=$('#tm-role').value==='owner'?'owner':'staff';
+    if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(em)){ toast('Type a valid email'); return; }
+    Cloud.w(Cloud.fb.setDoc(Cloud.fb.doc(Cloud.db,'roles',em),{role,email:em,at:Date.now()}),'team'); $('#tm-email').value=''; toast('Added '+em);
+  },
+  teamRemove(email){ if(!email||email===Cloud.email()) return; Cloud.w(Cloud.fb.deleteDoc(Cloud.fb.doc(Cloud.db,'roles',email)),'team'); toast('Removed '+email+'. Also delete the login in Firebase.'); },
   back, go:(v)=>go(v),
   tab(t,el){ clearAdded(); S.tab=t; S.stack=[]; S.params={}; S.sheet=null; if(t==='scan') startScan(); S.view = (el && el.dataset.sub) || ROOTS[t]; if(t!=='scan' && S.exh && t==='home') S.exh=false; render(); },
   seg(v){ S.view=v; render(); },
@@ -2126,6 +2349,7 @@ const A = {
     S.camWanted=false; S.sheet=null; Cam.stop(); render(); toast(extra?'Photo added to this product. Tap Save to keep it.':'Photo added. Tap Save to keep it.'); },
   adminArt(){ S.draftPhoto=null; S.formDraft=null; const isNew=S.params.id==null; const cat=$('#f-cat').value; const p=isNew?{art:DEFAULT_ART[cat]}:Products.get(S.params.id); $('#pimg').src=Products.img({...p,art:isNew?DEFAULT_ART[cat]:p.art,photo:null}); },
   async adminSave(){
+    if(!Cloud.isOwner()){ toast('Only the owner can add or change products'); return; }
     const v=id=>$(id).value.trim(); const name=v('#f-name'), cat=v('#f-cat'), price=parseInt(v('#f-price'),10), priceIntl=parseFloat(v('#f-intl')), stock=parseInt(v('#f-stock'),10), size=v('#f-size'), desc=v('#f-desc');
     const err=$('#f-err'); const fail=m=>{ err.textContent=m; err.hidden=false; };
     if(!name) return fail('Enter a product name.'); if(!(price>0)) return fail('Enter an Indian price above ₹0.'); if(!(priceIntl>0)) return fail('Enter the international price (above 0).'); if(!(stock>=0)) return fail('Enter the stock (0 or more).');
@@ -2135,7 +2359,7 @@ const A = {
       DB.products.push({serial,name,category:cat,price,priceIntl,stock,size,description:desc,art:DEFAULT_ART[cat],group:'',photo:S.draftPhoto||null,refs:[],refImgs:(S.draftRefs||[]).slice(0,5)});
       Matcher.indexProduct(Products.get(serial));
       Inventory.log('new',serial,stock,0,stock,'Product added · Serial No. '+ser(serial));
-      save(); SheetSync.push(); S.draftPhoto=undefined; S.formDraft=null; S.draftRefs=null; S.stack.pop(); S.view='admin'; S.params={}; render(); toast(`Added as Serial No. ${ser(serial)}`);
+      save(); SheetSync.push(); Cloud.saveProduct(Products.get(serial)); S.draftPhoto=undefined; S.formDraft=null; S.draftRefs=null; S.stack.pop(); S.view='admin'; S.params={}; render(); toast(`Added as Serial No. ${ser(serial)}`);
     } else {
       const p=Products.get(S.params.id); const notes=[];
       if(p.price!==price) notes.push(`Price ${inr(p.price)} → ${inr(price)}`);
@@ -2149,7 +2373,7 @@ const A = {
       if(S.draftRefs){ if(S.draftRefs.length!==(p.refImgs||[]).length) notes.push('Photos updated'); p.refImgs=S.draftRefs.slice(0,5); p.refs=[]; }
       Matcher.indexProduct(p);
       if(from!==stock||notes.length) Inventory.log('edit',p.serial,stock-from,from,stock,notes.join(' · ')||'Stock corrected');
-      save(); SheetSync.push(); S.draftPhoto=undefined; S.formDraft=null; S.draftRefs=null; back(); toast('Product saved');
+      save(); SheetSync.push(); Cloud.saveProduct(p); S.draftPhoto=undefined; S.formDraft=null; S.draftRefs=null; back(); toast('Product saved');
     }
   },
   syncNow(){ SheetSync.push(); render(); },
@@ -2165,7 +2389,7 @@ const A = {
   async shPush(){ toast('Sending…'); await SheetSync.push(true); render(); toast(SheetSync.error?('Not sent: '+SheetSync.error):'✓ Sent to the sheet'); },
   async shPull(){ S.shBusy='pull'; render(); try{ const n=await SheetSync.pull(); S.shBusy=null; render(); toast(`✓ Loaded ${n} products`); }catch(e){ S.shBusy=null; SheetSync.error=e.message; render(); toast('Could not load: '+e.message); } },
   resetAsk(){ S.sheet={type:'reset'}; render(); },
-  resetDo(){ Store.clear(); DB=seedDB(); FPCache.clear(); Matcher.reset(); Matcher.ready(); save(); S.sheet=null; S.stack=[]; S.tab='home'; S.view='home'; S.exh=false; startScan(); render(); toast('All data cleared'); },
+  resetDo(){ Store.clear(); DB=seedDB(); FPCache.clear(); Matcher.reset(); Matcher.ready(); save(); Cloud.resync(); S.sheet=null; S.stack=[]; S.tab='home'; S.view='home'; S.exh=false; startScan(); render(); toast('All data cleared'); },
 };
 const IN = {
   shUrl(t){ S.cfgDraft=Object.assign(S.cfgDraft||{},{url:t.value.trim()}); },
@@ -2175,8 +2399,8 @@ const IN = {
   phone(t){ DB.cart.phone=t.value; save(); },
   rate(t){ const v=parseFloat(t.value); if(v>0){ DB.settings.rates=Object.assign({},DB.settings.rates,{[t.dataset.code]:v}); save(); } },
   email(t){ DB.cart.email=t.value; save(); },
-  salePhone(t){ const s=curSale(); s.phone=t.value.trim(); save(); $('#sendBtns').innerHTML=sendBtns(s); const c=$('#invPhone'); if(c) c.textContent=s.phone||'—'; },
-  saleEmail(t){ const s=curSale(); s.email=t.value.trim(); save(); $('#sendBtns').innerHTML=sendBtns(s); const c=$('#invEmail'); if(c) c.textContent=s.email||'—'; },
+  salePhone(t){ const s=curSale(); s.phone=t.value.trim(); save(); Cloud.touchSale(s); $('#sendBtns').innerHTML=sendBtns(s); const c=$('#invPhone'); if(c) c.textContent=s.phone||'—'; },
+  saleEmail(t){ const s=curSale(); s.email=t.value.trim(); save(); Cloud.touchSale(s); $('#sendBtns').innerHTML=sendBtns(s); const c=$('#invEmail'); if(c) c.textContent=s.email||'—'; },
   q(t){ S.q=t.value; $('#results').innerHTML=searchResults(); },
   invq(t){ S.inv.q=t.value; $('#invList').innerHTML=invList(); },
   stk(t){ S.sheet.amt=Math.max(0,parseInt(t.value,10)||0); $('#stkPrev').innerHTML=stkPreview(); },
@@ -2185,14 +2409,15 @@ const IN = {
 document.addEventListener('click',e=>{ const b=e.target.closest('[data-act]'); if(!b || b.disabled) return; const f=A[b.dataset.act]; if(f){ e.preventDefault(); f(b.dataset.arg,b,e); } });
 document.addEventListener('input',e=>{ const k=e.target.dataset && e.target.dataset.in; if(k && IN[k]) IN[k](e.target); });
 document.addEventListener('change',e=>{ const ch=e.target.dataset && e.target.dataset.ch, v=e.target.value; if(!ch) return;
+  if(ch==='teamRole'){ const em=e.target.dataset.email; Cloud.w(Cloud.fb.setDoc(Cloud.fb.doc(Cloud.db,'roles',em),{role:v==='owner'?'owner':'staff',email:em,at:Date.now()}),'team'); return; }
   if(ch==='invCat'){ S.inv.cat=v; $('#invList').innerHTML=invList(); }
   if(ch==='autoAdd'){ DB.settings.autoAdd=e.target.checked; save(); }
   if(ch==='aiMode'){ DB.settings.aiMode=v; save(); location.reload(); }
   if(ch==='country'){ DB.cart.country=v; if(COUNTRIES[v]) DB.cart.currency=COUNTRIES[v].cur; if(DB.cart.discType==='amt') DB.cart.discVal=0; save(); render(); }
   if(ch==='currency'){ DB.cart.currency=v; if(DB.cart.discType==='amt') DB.cart.discVal=0; save(); render(); }
-  if(ch==='intlBase'){ const old=intlBase(), r=rates(); if(v!==old){ DB.products.forEach(p=>{ if(p.priceIntl) p.priceIntl=roundTo(p.priceIntl*r[old]/r[v],v); }); DB.settings.intlBase=v; save(); render(); toast(`International prices converted from ${old} to ${v}`); } }
+  if(ch==='intlBase'){ const old=intlBase(), r=rates(); if(v!==old){ DB.products.forEach(p=>{ if(p.priceIntl) p.priceIntl=roundTo(p.priceIntl*r[old]/r[v],v); }); DB.settings.intlBase=v; save(); DB.products.forEach(p=>Cloud.saveProduct(p)); render(); toast(`International prices converted from ${old} to ${v}`); } }
 });
-document.addEventListener('keydown',e=>{ if(e.key==='Escape' && S.sheet){ S.sheet=null; render(); } });
+document.addEventListener('keydown',e=>{ if(e.key==='Escape' && S.sheet){ S.sheet=null; render(); } if(e.key==='Enter' && e.target && e.target.id==='lg-pass'){ e.preventDefault(); A.cloudLogin(); } });
 
 /* ---------- photo input (camera via file input; works on phones) ---------- */
 function readFile(f){ return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsDataURL(f); }); }
@@ -2219,6 +2444,7 @@ $('#fileAdminExtra').addEventListener('change',async e=>{ const fs=[...e.target.
 render();
 Backend.check().then(render);
 Matcher.ready();   // index catalogue photos in the background
+Cloud.init();
 </script>
 
 <script>

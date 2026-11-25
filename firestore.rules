@@ -1,0 +1,46 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null && request.auth.token.email != null; }
+    function roleDoc() { return /databases/$(database)/documents/roles/$(request.auth.token.email); }
+    function hasRole() { return signedIn() && exists(roleDoc()); }
+    function isOwner() { return hasRole() && get(roleDoc()).data.role == 'owner'; }
+    function setupDone() { return exists(/databases/$(database)/documents/config/setup); }
+
+    // Who may use the app. The first login to press "Make me the owner" becomes the owner; after that only owners add people.
+    match /roles/{email} {
+      allow read: if signedIn() && (request.auth.token.email == email || isOwner());
+      allow create: if signedIn() && request.auth.token.email == email
+                    && request.resource.data.role == 'owner' && !setupDone();
+      allow create, update, delete: if isOwner();
+    }
+    match /config/setup {
+      allow read: if signedIn();
+      allow create: if signedIn() && !setupDone();
+    }
+
+    // Products and photos: owners change anything; staff can only change stock and scanner photos.
+    match /products/{id} {
+      allow read: if hasRole();
+      allow create, delete: if isOwner();
+      allow update: if isOwner() || (hasRole() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['stock', 'refImgs', 'updatedAt']));
+    }
+
+    // Bills: staff can add bills and update the sent/phone/email fields; only owners can delete.
+    match /sales/{id} {
+      allow read: if hasRole();
+      allow create: if hasRole();
+      allow update: if isOwner() || (hasRole() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['shared', 'phone', 'email']));
+      allow delete: if isOwner();
+    }
+
+    // Prices in other currencies, exchange rates.
+    match /settings/{id} {
+      allow read: if hasRole();
+      allow write: if isOwner();
+    }
+  }
+}

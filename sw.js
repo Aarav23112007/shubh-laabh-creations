@@ -6,7 +6,7 @@
    - The scanner's model files are saved by the app itself the first time the scanner loads.
    - /api/* (sending by WhatsApp or email) always goes to the network and is never saved.
    Change VERSION whenever you change the lists below, so phones pick up the new lists. */
-const VERSION = 'v1';
+const VERSION = 'v2';
 const SHELL = 'slc-shell-' + VERSION;
 const CDN = 'slc-cdn-' + VERSION;
 
@@ -17,9 +17,12 @@ const CDN_FILES = [
   TF + '/dist/ort-wasm-simd-threaded.jsep.mjs',
   TF + '/dist/ort-wasm-simd-threaded.jsep.wasm',          // ~22 MB, the engine that runs the scanner
   'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
+  'https://www.gstatic.com/firebasejs/13.4.0/firebase-app.js',
+  'https://www.gstatic.com/firebasejs/13.4.0/firebase-auth.js',
+  'https://www.gstatic.com/firebasejs/13.4.0/firebase-firestore.js',
   'https://fonts.googleapis.com/css2?family=Marcellus&family=Figtree:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@500;600&display=swap'
 ];
-const CDN_HOSTS = ['cdn.jsdelivr.net', 'cdnjs.cloudflare.com', 'fonts.googleapis.com', 'fonts.gstatic.com'];
+const CDN_HOSTS = ['cdn.jsdelivr.net', 'cdnjs.cloudflare.com', 'fonts.googleapis.com', 'fonts.gstatic.com', 'www.gstatic.com'];   // www.gstatic.com = the sign-in / database library
 
 /* a redirected response cannot be served to a page navigation, so store a clean copy */
 async function clean(res) {
