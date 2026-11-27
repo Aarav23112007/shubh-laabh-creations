@@ -6,7 +6,7 @@
    - The scanner's model files are saved by the app itself the first time the scanner loads.
    - /api/* (sending by WhatsApp or email) always goes to the network and is never saved.
    Change VERSION whenever you change the lists below, so phones pick up the new lists. */
-const VERSION = 'v2';
+const VERSION = 'v3';
 const SHELL = 'slc-shell-' + VERSION;
 const CDN = 'slc-cdn-' + VERSION;
 
@@ -59,7 +59,17 @@ self.addEventListener('activate', e => {
 async function appFile(req, key) {
   const cache = await caches.open(SHELL);
   const saved = await cache.match(key);
-  const refresh = fetch(req).then(async r => { if (r.ok) await cache.put(key, await clean(r.clone())); return r; }).catch(() => null);
+  const oldText = saved && key === 'index.html' ? saved.clone().text().catch(() => '') : null;
+  const refresh = fetch(req, { cache: 'no-store' }).then(async r => {
+    if (r.ok) {
+      const copy = await clean(r.clone());
+      if (oldText) {                         // a NEW version of the app was just downloaded → tell the open page
+        const [a, b] = await Promise.all([oldText, copy.clone().text()]);
+        if (a && b && a !== b) for (const c of await self.clients.matchAll({ type: 'window' })) c.postMessage({ type: 'slc-update' });
+      }
+      await cache.put(key, copy);
+    }
+    return r; }).catch(() => null);
   if (saved) { refresh.catch(() => {}); return saved; }
   const r = await refresh;
   return r || new Response('Offline, and this file was not saved yet. Open the app once with internet.', { status: 503 });

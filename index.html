@@ -203,6 +203,9 @@ button.list-row:hover{background:var(--sunk)}
 .auto-row span{display:flex;flex-direction:column}.auto-row small{color:var(--muted);font-size:12.5px}
 .wa-open{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:13px;color:var(--muted)}
 .wa-open select{border:1px solid var(--line);border-radius:10px;padding:6px 8px;background:var(--surface);font-size:13px;font-weight:600;color:var(--ink)}
+.engine{font-size:12.5px;color:var(--muted);margin:0}.engine.ok{color:var(--ok)}
+.upd-bar{position:fixed;left:50%;transform:translateX(-50%);top:calc(env(safe-area-inset-top,0px) + 8px);z-index:60;display:flex;gap:12px;align-items:center;background:var(--ink);color:var(--app);padding:10px 12px 10px 16px;border-radius:14px;font-size:14px;box-shadow:var(--shadow);max-width:calc(100% - 24px)}
+.upd-bar button{background:var(--marigold);color:var(--marigold-ink);font-weight:800;border-radius:10px;padding:8px 12px}
 .scanline{position:absolute;left:0;right:0;height:70px;top:-70px;background:linear-gradient(180deg,transparent,rgba(232,167,67,.45),transparent);animation:scan 1.4s linear infinite}
 .is-analysing img{filter:saturate(.8) brightness(.85)}
 @keyframes scan{to{top:100%}}
@@ -485,6 +488,7 @@ td.nm{min-width:120px;font-weight:600}
 </style>
 
 <div id="app"></div>
+<div id="updBar" class="upd-bar" hidden><span><b>New version ready.</b> Your bill is kept.</span><button onclick="location.reload()">Update now</button></div>
 <div id="toast" role="status" aria-live="polite"></div>
 <input type="file" id="fileCam" accept="image/*" capture="environment" hidden>
 <input type="file" id="fileUp" accept="image/*" hidden>
@@ -947,7 +951,7 @@ const AI = {
       const warm=document.createElement('canvas'); warm.width=warm.height=224;
       for(let i=0;i<3;i++) await this.embedCanvas(warm,false);   // first runs compile the model; done at startup, not during a scan
       this.state='ready'; return this.ext;
-    })().catch(e=>{ console.warn('AI model unavailable:',e); this.state='off'; return null; });
+    })().catch(e=>{ console.warn('AI model unavailable:',e); this.error=String(e&&e.message||e).slice(0,120); this.state='off'; return null; });
     return this.p;
   },
   withTimeout(ms){ return Promise.race([this.load(), wait(ms).then(()=>null)]); },
@@ -1541,7 +1545,7 @@ V.scan = () => {
       ${unsure?`<div class="note warn">${ic('alert')}<span><b>We found similar products.</b> The AI is not sure, so nothing was selected automatically. Please select the correct product.</span></div>`:`<div class="note info">${ic('info')}<span>Pick the product that matches what the customer is buying.</span></div>`}
       ${sc.result.noMatch?`<div class="note bad">${ic('alert')}<span><b>${sc.result.unlike?'This looks like a different item':'No close match in your catalogue'}</b> (best ${Math.round((sc.result.candidates[0]||{conf:0}).conf*100)}%). ${sc.result.unlike?'It is less alike than that product’s own photos, e.g. a similar-coloured but different item. ':''}If it is a new product, add it with this photo; otherwise pick the right one below.</span></div><button class="btn btn-primary" data-act="addFromScan">${ic('plus')} Add as new product with this photo</button>`:''}
       ${qualityNote(sc.result)}
-      <div class="compare" style="grid-template-columns:110px 1fr"><figure><img src="${sc.photo}" alt="Your photo"><figcaption>Your photo</figcaption></figure><p class="hint">${sc.result.plain?'This item has few details (plain surface), so the match is based on overall shape and colour. ':''}Compare shape, size, logo and colour. Look-alike products can have very different prices.</p></div>
+      <div class="compare" style="grid-template-columns:110px 1fr"><figure><img src="${sc.photo}" alt="Your photo"><figcaption>Your photo</figcaption></figure><p class="hint">${AI.state!=='ready'?'<b>AI scanner not loaded: basic colour matching only.</b> ':''}${(()=>{ const t=sc.result.candidates[0]&&Products.get(sc.result.candidates[0].serial); const n=t?(t.photo?1:0)+(t.refImgs||[]).length:0; return t&&n<2?`<b>${esc(t.name)}</b> has only ${n} photo, so it is hard to tell apart from similar items. `:''; })()}${sc.result.plain?'This item has few details (plain surface), so the match is based on overall shape and colour. ':''}Compare shape, size, logo and colour. Look-alike products can have very different prices.</p></div>
       ${sc.options.map((o,i)=>{ const p=Products.get(o.serial); if(!p) return ''; const on=sc.selected===p.serial; return `<button class="opt ${on?'on':''}" data-act="pickOpt" data-arg="${p.serial}" aria-pressed="${on}"><img src="${Products.img(p)}" alt=""><span class="opt-body"><span class="opt-k">Option ${i+1}</span><b>${esc(p.name)}</b><span class="mono" style="font-size:12.5px">Serial No. ${ser(p.serial)}</span><span class="opt-meta">${esc(p.size)} · Stock ${p.stock}</span></span><span class="opt-end"><b>${inr(p.price)}</b>${o.conf!=null?`<small>${Math.round(o.conf*100)}% match</small>`:'<small>look-alike</small>'}<span class="radio"></span></span></button>`; }).join('')}
       <button class="link" data-act="go" data-arg="search" style="align-self:center;padding:6px">${ic('search')} None of these? Search the catalogue</button>
     </div>
@@ -1584,10 +1588,19 @@ function recentStrip(){
   const items=recentItems(); if(!items.length) return '';
   return `<div class="recent"><span class="k-l">Recent · tap to add 1</span><div class="recent-row">${items.map(p=>`<button class="rc" data-act="quickAdd" data-arg="${p.serial}" ${p.stock-Billing.qtyOf(p.serial)<1?'disabled':''}><img src="${Products.img(p)}" alt=""><span>${esc(p.name)}</span></button>`).join('')}</div></div>`;
 }
+function engineNote(){
+  if(AI.state==='ready') return `<p class="engine ok">● AI scanner ready (${AI.device==='gpu'?'graphics chip':'processor'}) · ${Object.keys(Matcher.idx).length} products prepared</p>`;
+  if(AI.state==='off') return `<div class="note bad">${ic('alert')}<span><b>AI scanner could not load</b>, so only basic colour matching is used and similar-coloured items (e.g. white adapter / white power bank) get mixed up. Check the internet and reopen the app.${AI.error?` <small class="muted">(${esc(AI.error)})</small>`:''}</span></div>`;
+  return '<p class="engine">● Loading the AI scanner…</p>';
+}
+function photosNote(){
+  const few=DB.products.filter(p=>Products.hasPhoto(p) && (p.photo?1:0)+(p.refImgs||[]).length<2);
+  return few.length?`<p class="hint">${few.length} product${few.length>1?'s have':' has'} only 1 photo. Add 2–3 more (back, side, top) for reliable matching.</p>`:'';
+}
 function scanStatus(){
   const noPhoto=DB.products.filter(p=>!Products.hasPhoto(p)).length;
   const prep = Matcher._p && Matcher.done<Matcher.total ? `<p class="hint">Preparing scanner… ${Matcher.done}/${Matcher.total} products</p>` : AI.state==='loading' ? '<p class="hint">Loading the AI model (first time only)…</p>' : '';
-  return prep + (noPhoto?`<div class="note warn">${ic('image')}<span><b>${noPhoto} product${noPhoto>1?'s have':' has'} no real photo</b> and can't be scanned. <button class="link" data-act="go" data-arg="admin">Add photos</button></span></div>`:'');
+  return engineNote() + prep + photosNote() + (noPhoto?`<div class="note warn">${ic('image')}<span><b>${noPhoto} product${noPhoto>1?'s have':' has'} no real photo</b> and can't be scanned. <button class="link" data-act="go" data-arg="admin">Add photos</button></span></div>`:'');
 }
 function qualityNote(r){
   const q=r&&r.quality; if(!q) return '';
@@ -1712,10 +1725,10 @@ const isMobile = () => /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
    "app" (default): whatsapp://send?phone=… opens that chat in the WhatsApp app on the phone or laptop,
    with no in-between web page. (On a laptop the browser asks "Open WhatsApp?" the first time: tick "Always allow".)
    "web": opens the chat in WhatsApp Web (laptop) / wa.me (phone) in a new tab. */
-function openWaChat(ph){
-  const mode=DB.settings.waOpen||'app';
-  if(mode==='web'){ const url=isMobile()?`https://wa.me/${ph}`:`https://web.whatsapp.com/send?phone=${ph}`; if(!window.open(url,'_blank')) location.href=url; return; }
-  const a=document.createElement('a'); a.href=`whatsapp://send?phone=${ph}`; a.rel='noopener'; document.body.appendChild(a); a.click(); a.remove();
+function openWaChat(ph,text){
+  const mode=DB.settings.waOpen||'app', t=text?'&text='+encodeURIComponent(text):'';
+  if(mode==='web'){ const url=isMobile()?`https://wa.me/${ph}?${t.slice(1)}`:`https://web.whatsapp.com/send?phone=${ph}${t}`; if(!window.open(url,'_blank')) location.href=url; return; }
+  const a=document.createElement('a'); a.href=`whatsapp://send?phone=${ph}${t}`; a.rel='noopener'; document.body.appendChild(a); a.click(); a.remove();
 }
 function sendCard(s){
   return `<div class="card stack" style="gap:12px"><div class="disc-h"><b>Send bill to customer</b><span id="sentTag">${sentTag(s)}</span></div>
@@ -1737,7 +1750,7 @@ function sendBtns(s){
     <div class="row2"><button class="btn btn-wa" data-act="sendWa" ${ph?'':'disabled'}>${ic('chat')} WhatsApp PDF</button><button class="btn btn-primary" data-act="sendMail" ${em?'':'disabled'}>${ic('mail')} Email PDF</button></div>
     <button class="btn btn-ghost" data-act="sendPdf">${ic('file')} Share or save PDF</button>
     <label class="wa-open"><span>Open WhatsApp in</span><select id="waOpen" data-ch="waOpen"><option value="app" ${(DB.settings.waOpen||'app')==='app'?'selected':''}>WhatsApp app</option><option value="web" ${DB.settings.waOpen==='web'?'selected':''}>WhatsApp Web (browser)</option></select></label>
-    <p class="hint">${!ph?'Add the customer’s WhatsApp number. ':B.whatsapp?`<b>WhatsApp:</b> the chat with <b>+${ph}</b> opens and the PDF is sent straight to it. `:`<b>WhatsApp:</b> the chat with <b>+${ph}</b> opens directly and the PDF is saved at the same time: tap 📎 → Document → the newest PDF. `}${!em?'Add an email address to email the PDF. ':B.email?'<b>Email:</b> the PDF is emailed straight to the customer. ':'<b>Email:</b> direct sending is not set up. '}${B.whatsapp&&B.email?'':'<button class="link" data-act="go" data-arg="sending">Set up direct sending</button>'}</p></div>`;
+    <p class="hint">${!ph?'Add the customer’s WhatsApp number. ':B.whatsapp?`<b>WhatsApp:</b> the chat with <b>+${ph}</b> opens and the PDF is sent straight to it. `:`<b>WhatsApp:</b> the chat with <b>+${ph}</b> opens with the bill already typed in. <b>Tap Send in WhatsApp</b> (a website can never press Send for you), then 📎 → Document → the saved PDF. `}${!em?'Add an email address to email the PDF. ':B.email?'<b>Email:</b> the PDF is emailed straight to the customer. ':'<b>Email:</b> direct sending is not set up. '}${B.whatsapp&&B.email?'':'<button class="link" data-act="go" data-arg="sending">Set up direct sending</button>'}</p></div>`;
 }
 function markShared(kind){ const s=curSale(); if(!s) return; s.shared=Object.assign({},s.shared,{[kind]:Date.now()}); save(); Cloud.touchSale(s); const t=$('#sentTag'); if(t) t.innerHTML=sentTag(s); }
 
@@ -2325,9 +2338,9 @@ const A = {
     }
     // 1) save the PDF now (ready to attach), 2) open that customer's chat directly — both in the same tap
     const saving = savePdf(s, blob||undefined);
-    openWaChat(ph);
+    openWaChat(ph, billText(s,true)+'\n\n(PDF invoice attached)');
     markShared('wa');
-    if(await saving) toast('Chat with +'+ph+' opened. Attach the PDF: 📎 → Document → '+pdfName(s));
+    if(await saving) toast('Bill typed into the chat with +'+ph+'. Tap SEND in WhatsApp, then 📎 → Document → '+pdfName(s));
   },
   async sendMail(){
     const s=curSale(); if(!s || !validEmail(s.email)) return;
@@ -2516,7 +2529,7 @@ Cloud.init();
   if(['localhost','127.0.0.1'].includes(location.hostname) && !/[?&]sw=1/.test(location.search)) return;
   const status = async () => {
     const out={worker:!!navigator.serviceWorker.controller, libs:0, model:false, pdf:false};
-    try{ const c=await caches.open('slc-cdn-v1'); out.libs=(await c.keys()).length; }catch(e){}
+    try{ const k=(await caches.keys()).filter(n=>n.startsWith('slc-cdn-')).sort().pop(); if(k) out.libs=(await (await caches.open(k)).keys()).length; }catch(e){}
     try{ out.model=(await (await caches.open('transformers-cache')).keys()).some(r=>/\.onnx(\?|$)/.test(r.url)); }catch(e){}   // the scanner's model file itself, not just its small settings files
     out.pdf=!!window.jspdf;
     out.ready = out.worker && out.libs>=4 && out.model;
@@ -2524,7 +2537,15 @@ Cloud.init();
   };
   window.offlineStatus = status;
   addEventListener('load',()=>{
-    navigator.serviceWorker.register('sw.js').then(()=>navigator.serviceWorker.ready).then(async()=>{
+    navigator.serviceWorker.addEventListener('message',e=>{
+      if(!e.data || e.data.type!=='slc-update') return;
+      const busy = (typeof DB!=='undefined' && DB.cart && DB.cart.items.length) || (typeof S!=='undefined' && (S.sheet || ['review','adminEdit'].includes(S.view)));
+      if(!busy){ location.reload(); return; }                // nothing in progress: switch to the new version now
+      const b=document.getElementById('updBar'); if(b) b.hidden=false;
+    });
+    const check=()=>navigator.serviceWorker.getRegistration().then(r=>r&&r.update()).catch(()=>{});
+    document.addEventListener('visibilitychange',()=>{ if(!document.hidden){ check(); fetch(location.pathname,{cache:'no-store'}).catch(()=>{}); } });
+    navigator.serviceWorker.register('sw.js',{updateViaCache:'none'}).then(()=>navigator.serviceWorker.ready).then(async()=>{
       // fetch the PDF library now, while there is internet, so invoices also work offline
       try{ if(navigator.onLine && typeof loadJsPDF==='function') await loadJsPDF(); }catch(e){}
       // tell the user once, when the scanner model has also finished saving
