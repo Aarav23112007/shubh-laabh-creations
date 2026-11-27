@@ -47,6 +47,7 @@
   --shadow:0 1px 2px rgba(0,0,0,.3); color-scheme:dark;
 }
 *{box-sizing:border-box}
+[hidden]{display:none!important}   /* anything the app hides stays hidden, even if a class sets display */
 html{height:100%}
 body{height:100%;margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 var(--f-body);-webkit-font-smoothing:antialiased;-webkit-tap-highlight-color:transparent}
 @media (min-width:520px){body{background-image:radial-gradient(var(--line) 1px,transparent 1.6px);background-size:18px 18px}}
@@ -1725,6 +1726,12 @@ const isMobile = () => /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
    "app" (default): whatsapp://send?phone=… opens that chat in the WhatsApp app on the phone or laptop,
    with no in-between web page. (On a laptop the browser asks "Open WhatsApp?" the first time: tick "Always allow".)
    "web": opens the chat in WhatsApp Web (laptop) / wa.me (phone) in a new tab. */
+const waText = s => billText(s,true)+'\n\n(PDF invoice will follow)';
+function waLinks(s){
+  const ph=normPhone(s.phone,s.country), t=encodeURIComponent(waText(s)), plain=encodeURIComponent(billText(s,false));
+  return { app:`whatsapp://send?phone=${ph}&text=${t}`, web: isMobile()?`https://wa.me/${ph}?text=${t}`:`https://web.whatsapp.com/send?phone=${ph}&text=${t}`,
+           sms:`sms:+${ph}${/iPhone|iPad|iPod/i.test(navigator.userAgent)?'&':'?'}body=${plain}` };
+}
 function openWaChat(ph,text){
   const mode=DB.settings.waOpen||'app', t=text?'&text='+encodeURIComponent(text):'';
   if(mode==='web'){ const url=isMobile()?`https://wa.me/${ph}?${t.slice(1)}`:`https://web.whatsapp.com/send?phone=${ph}${t}`; if(!window.open(url,'_blank')) location.href=url; return; }
@@ -1743,14 +1750,14 @@ function refsCard(){
     <div class="row2"><button type="button" class="btn btn-ghost" data-act="adminCamExtra" ${full?'disabled':''}>${ic('camera')} Take ${['back','side','top','close-up','extra'][refs.length]||'extra'} photo</button><button type="button" class="btn btn-ghost" data-act="refUpload" ${full?'disabled':''}>${ic('upload')} Upload</button></div></div>`;
 }
 function readForm(){ const v=id=>{ const e=$(id); return e?e.value:''; }; return {newCat:v('#f-newcat'),name:v('#f-name'),category:v('#f-cat'),price:v('#f-price'),priceIntl:v('#f-intl'),stock:v('#f-stock'),size:v('#f-size'),description:v('#f-desc')}; }
-function sentTag(s){ const sh=s.shared||{}; const t=[sh.wa&&'WhatsApp',sh.mail&&'Email',sh.pdf&&'PDF'].filter(Boolean); return t.length?`<span class="badge b-ok">Sent: ${t.join(', ')}</span>`:''; }
+function sentTag(s){ const sh=s.shared||{}; const t=[sh.wa&&'WhatsApp',sh.sms&&'SMS',sh.mail&&'Email',sh.pdf&&'PDF'].filter(Boolean); return t.length?`<span class="badge b-ok">Sent: ${t.join(', ')}</span>`:''; }
 function sendBtns(s){
   const ph=normPhone(s.phone,s.country), em=validEmail(s.email), B=Backend.status;
   return `<div class="stack" style="gap:8px">
     <div class="row2"><button class="btn btn-wa" data-act="sendWa" ${ph?'':'disabled'}>${ic('chat')} WhatsApp PDF</button><button class="btn btn-primary" data-act="sendMail" ${em?'':'disabled'}>${ic('mail')} Email PDF</button></div>
-    <button class="btn btn-ghost" data-act="sendPdf">${ic('file')} Share or save PDF</button>
+    <div class="row2">${ph?`<a class="btn btn-ghost" href="${esc(waLinks(s).sms)}" data-track="sms">${ic('chat')} SMS bill</a>`:`<button class="btn btn-ghost" disabled>${ic('chat')} SMS bill</button>`}<button class="btn btn-ghost" data-act="sendPdf">${ic('file')} Share or save PDF</button></div>
     <label class="wa-open"><span>Open WhatsApp in</span><select id="waOpen" data-ch="waOpen"><option value="app" ${(DB.settings.waOpen||'app')==='app'?'selected':''}>WhatsApp app</option><option value="web" ${DB.settings.waOpen==='web'?'selected':''}>WhatsApp Web (browser)</option></select></label>
-    <p class="hint">${!ph?'Add the customer’s WhatsApp number. ':B.whatsapp?`<b>WhatsApp:</b> the chat with <b>+${ph}</b> opens and the PDF is sent straight to it. `:`<b>WhatsApp:</b> the chat with <b>+${ph}</b> opens with the bill already typed in. <b>Tap Send in WhatsApp</b> (a website can never press Send for you), then 📎 → Document → the saved PDF. `}${!em?'Add an email address to email the PDF. ':B.email?'<b>Email:</b> the PDF is emailed straight to the customer. ':'<b>Email:</b> direct sending is not set up. '}${B.whatsapp&&B.email?'':'<button class="link" data-act="go" data-arg="sending">Set up direct sending</button>'}</p></div>`;
+    <p class="hint">${!ph?'Add the customer’s WhatsApp number. ':B.whatsapp?`<b>WhatsApp:</b> the chat with <b>+${ph}</b> opens and the PDF is sent straight to it. `:`<b>WhatsApp / SMS:</b> the chat with <b>+${ph}</b> opens with the bill already typed in. <b>Tap Send</b> there (phones never let a website press Send). `}${!em?'Add an email address to email the PDF. ':B.email?'<b>Email:</b> the PDF is emailed straight to the customer. ':'<b>Email:</b> direct sending is not set up. '}${B.whatsapp&&B.email?'':'<button class="link" data-act="go" data-arg="sending">Set up direct sending</button>'}</p></div>`;
 }
 function markShared(kind){ const s=curSale(); if(!s) return; s.shared=Object.assign({},s.shared,{[kind]:Date.now()}); save(); Cloud.touchSale(s); const t=$('#sentTag'); if(t) t.innerHTML=sentTag(s); }
 
@@ -2123,6 +2130,18 @@ function sheetHTML(){
       <p class="hint">Use a plain background and good light, with the product filling the frame. The scanner compares against this photo.</p>
       <button class="btn btn-ghost" data-act="closeSheet">Cancel</button></div>`;
   }
+  if(sh.type==='waHelp'){
+    const s=curSale(); if(!s) return ''; const L=waLinks(s), ph=normPhone(s.phone,s.country);
+    return `<div class="sheet-back" data-act="closeSheet"></div><div class="sheet" role="dialog" aria-label="Send the bill"><span class="grab"></span>
+      <h2 class="h-display">Send the bill to +${ph}</h2>
+      <p class="muted">WhatsApp should now show the chat with the bill typed in. <b>Tap Send there.</b> Did it not open? Use a button below.</p>
+      <a class="btn btn-wa" href="${esc(L.app)}">${ic('chat')} Open WhatsApp app</a>
+      <a class="btn btn-ghost" href="${esc(L.web)}" target="_blank" rel="noopener">${ic('chat')} Open WhatsApp Web</a>
+      <a class="btn btn-ghost" href="${esc(L.sms)}" data-track="sms">${ic('chat')} Send as SMS instead</a>
+      <div class="row2"><button class="btn btn-ghost" data-act="copyBill">${ic('file')} Copy bill text</button><button class="btn btn-ghost" data-act="sendPdf">${ic('file')} Save / share PDF</button></div>
+      <p class="hint">To add the PDF: in the chat tap 📎 → Document → ${esc(pdfName(s))}.</p>
+      <button class="btn btn-primary" data-act="closeSheet">Done</button></div>`;
+  }
   if(sh.type==='reset'){
     return `<div class="sheet-back" data-act="closeSheet"></div><div class="sheet" role="dialog" aria-label="Clear all data"><span class="grab"></span>
       <h2 class="h-display">Clear all data?</h2><p class="muted">This permanently removes every product, bill and stock change saved on this device. It cannot be undone.</p>
@@ -2336,12 +2355,15 @@ const A = {
       catch(e){ toast('WhatsApp: '+e.message); }
       return;
     }
-    // 1) save the PDF now (ready to attach), 2) open that customer's chat directly — both in the same tap
-    const saving = savePdf(s, blob||undefined);
-    openWaChat(ph, billText(s,true)+'\n\n(PDF invoice attached)');
+    // open the customer's chat with the bill typed in — first, so nothing (like a download) can block it
+    openWaChat(ph, waText(s));
     markShared('wa');
-    if(await saving) toast('Bill typed into the chat with +'+ph+'. Tap SEND in WhatsApp, then 📎 → Document → '+pdfName(s));
+    S.sheet={type:'waHelp'}; render();
+    if(!isMobile()) savePdf(s, blob||undefined);       // laptop: PDF saved too, ready to drag into the chat
   },
+  async copyBill(){ const s=curSale(); if(!s) return; const t=billText(s,false);
+    try{ await navigator.clipboard.writeText(t); toast('Bill copied. Paste it into any chat.'); }
+    catch(e){ const ta=document.createElement('textarea'); ta.value=t; document.body.appendChild(ta); ta.select(); try{ document.execCommand('copy'); toast('Bill copied. Paste it into any chat.'); }catch(_){ toast('Could not copy on this device'); } ta.remove(); } },
   async sendMail(){
     const s=curSale(); if(!s || !validEmail(s.email)) return;
     if(Backend.status.email){
@@ -2478,6 +2500,7 @@ const IN = {
 };
 
 document.addEventListener('click',e=>{ const b=e.target.closest('[data-act]'); if(!b || b.disabled) return; const f=A[b.dataset.act]; if(f){ e.preventDefault(); f(b.dataset.arg,b,e); } });
+document.addEventListener('click',e=>{ const t=e.target.closest('[data-track]'); if(t) markShared(t.dataset.track); });   // real links (SMS) still open normally
 document.addEventListener('input',e=>{ const k=e.target.dataset && e.target.dataset.in; if(k && IN[k]) IN[k](e.target); });
 document.addEventListener('change',e=>{ const ch=e.target.dataset && e.target.dataset.ch, v=e.target.value; if(!ch) return;
   if(ch==='teamRole'){ const em=e.target.dataset.email; Cloud.w(Cloud.fb.setDoc(Cloud.fb.doc(Cloud.db,'roles',em),{role:v==='owner'?'owner':'staff',email:em,at:Date.now()}),'team'); return; }
