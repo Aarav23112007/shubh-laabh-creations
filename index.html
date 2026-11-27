@@ -201,6 +201,8 @@ button.list-row:hover{background:var(--sunk)}
 .auto-row{display:flex;gap:10px;align-items:flex-start;font-size:14px}
 .auto-row input{width:20px;height:20px;margin-top:2px;accent-color:var(--peacock)}
 .auto-row span{display:flex;flex-direction:column}.auto-row small{color:var(--muted);font-size:12.5px}
+.wa-open{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:13px;color:var(--muted)}
+.wa-open select{border:1px solid var(--line);border-radius:10px;padding:6px 8px;background:var(--surface);font-size:13px;font-weight:600;color:var(--ink)}
 .scanline{position:absolute;left:0;right:0;height:70px;top:-70px;background:linear-gradient(180deg,transparent,rgba(232,167,67,.45),transparent);animation:scan 1.4s linear infinite}
 .is-analysing img{filter:saturate(.8) brightness(.85)}
 @keyframes scan{to{top:100%}}
@@ -753,7 +755,21 @@ function photoSVG(a,{count=1,tilt=0,scene='stall',zoom=1}={}){
    [serial, name, category, price, stock, size/variant, description, art, look-alike group]
    ===================================================================== */
 const W='Wall Hanging', J='Artificial Jewellery', H='Decorative Home', AC='Decorative Accessories', G='Gift Items', C='Art & Craft';
-const CATEGORIES=[W,J,H,AC,G,C];
+const CATEGORIES=[W,J,H,AC,G,C];   // built-in categories; add your own in More → Categories or in the product form
+function allCategories(){
+  const out=[...CATEGORIES]; const add=c=>{ c=String(c||'').trim(); if(c && !out.some(x=>x.toLowerCase()===c.toLowerCase())) out.push(c); };
+  ((typeof DB!=='undefined' && DB.settings && DB.settings.customCategories)||[]).forEach(add);
+  ((typeof DB!=='undefined' && DB.products)||[]).forEach(p=>add(p.category));
+  return out;
+}
+const artFor = cat => DEFAULT_ART[cat] || DEFAULT_ART['Gift Items'];   // picture used until a real photo is added
+function addCategory(name){
+  name=String(name||'').trim().replace(/\s+/g,' ');
+  if(!name) return {err:'Type a category name.'};
+  if(name.length>40) return {err:'Keep the category name under 40 letters.'};
+  const ex=allCategories().find(c=>c.toLowerCase()===name.toLowerCase()); if(ex) return {name:ex};
+  DB.settings.customCategories=[...(DB.settings.customCategories||[]), name]; save(); return {name, added:true};
+}
 /* The first demo shipped 30 sample products. They are removed from saved data on load (one time). */
 const OLD_DEMO={1:'Handmade Lotus Wall Hanging',2:'Handmade Peacock Wall Hanging',3:'Premium Floral Wall Hanging',4:'Mandala Macramé Wall Hanging',5:'Ganesha Toran Wall Hanging',8:'Bead & Bell Door Toran',11:'Elephant Parade Wall Hanging',14:'Large Lotus Wall Hanging',19:'Mini Lotus Pair Wall Hanging',22:'Peacock Feather Jhoomer',27:'Premium Lotus Wall Hanging',31:'Kundan Choker Set',38:'Oxidised Jhumka Earrings',45:'Artificial Pearl Necklace',49:'Meenakari Bangles (Set of 4)',52:'Temple Gold Necklace',60:'Hand-painted Diya Set (4)',66:'Brass Finish Urli Bowl',71:'Terracotta Wind Chime',87:'Decorative Lippan Mirror',92:'Mirror-work Cushion Cover',95:'Embroidered Potli Bag',99:'Beaded Key Holder',103:'Shubh Laabh Door Hanging Pair',108:'Festive Diya Gift Hamper',112:'Hand-painted Wooden Coasters (6)',118:'Mini Lippan Art Frame',121:'Madhubani Bookmark Set',124:'Quilled Paper Wall Art',127:'Macramé Plant Hanger'};
 
@@ -1002,7 +1018,7 @@ const words=t=>String(t).toLowerCase().split(/[^a-z]+/).filter(w=>w.length>=4&&!
    Each product holds several references: its catalogue image (photo or illustration)
    plus every real photo the seller has confirmed for it ("learning from confirmations"). */
 const Matcher = {
-  idx:{}, _p:null, done:0, total:0,
+  self:{}, selfDetail:{}, idx:{}, _p:null, done:0, total:0,
   ready(){ return this._p || (this._p=(async()=>{
     const m=await AI.withTimeout(25000);
     if(!m && AI.state==='loading') AI.load().then(x=>{ if(x){ this.reset(); this.ready(); } });   // slow network: re-index once the model arrives
@@ -1027,6 +1043,13 @@ const Matcher = {
     if(p.photo) list.push(await this.ref(p.photo,'photo'));
     for(const t of (p.refImgs||[])) list.push(await this.ref(t,'photo'));
     this.idx[p.serial]=list;
+    // How alike this product's OWN photos are. A scan of the same item should be about this similar;
+    // a different item of the same colour/shape (adapter vs power bank) usually falls clearly below it.
+    const sims=[]; for(let i=0;i<list.length;i++) for(let j=i+1;j<list.length;j++){ let m=0; for(const x of list[i].embs) for(const y of list[j].embs){ const v=dot(x,y); if(v>m) m=v; } if(m) sims.push(m); }
+    sims.sort((x,y)=>x-y); this.self[p.serial] = sims.length ? sims[Math.floor((sims.length-1)/2)] : null;
+    // and how well their fine details (logos, patterns, edges) line up with each other
+    let sd=0; for(let i=0;i<list.length;i++) for(let j=0;j<list.length;j++){ if(i===j || !list[i].patches || !list[j].patches) continue; const d=detailScore(list[i].patches,list[j].patches,list[i].w).score; if(d>sd) sd=d; }
+    this.selfDetail[p.serial] = sd || null;
   },
   /* fingerprint ranking; opts.category limits the search, opts.exclude hides one photo (accuracy test) */
   rank(q,opts={}){
@@ -1081,12 +1104,23 @@ const Recognition = {
     let confident=false, how='';
     // Measured on the benchmark: every wrong top answer led the runner-up by ≤ 0.07, every lead ≥ 0.10 was right.
     // So "sure" = a real match (≥ 0.45) that clearly beats the next product once details are counted.
-    if(q.gs){ if(a.g>=.45 && gapS>=.10){ confident=true; how = plain ? 'fingerprint' : 'details'; } }
+    // Also: the scan must be about as similar to the product as the product's own photos are to each other.
+    // Products with only one photo have nothing to compare with, so they need a stronger match to be auto-added.
+    // Tested on look-alikes that are NOT in the catalogue: a real match shows detail agreement ≥ ~80% of what the
+    // product's own photos show; a different look-alike item usually shows 40–55%.
+    const self=Matcher.self[a.serial], sd=Matcher.selfDetail[a.serial], ratio = (!plain && sd && a.detail!=null) ? a.detail/sd : null;
+    if(q.gs){
+      if(plain){ const bar = self ? Math.min(.8, Math.max(.5, self-.05)) : .65;          // plain items (e.g. white chargers): stricter
+        if(a.g>=bar && gapS>=.15){ confident=true; how='fingerprint'; } }
+      else { const bar = self ? Math.min(.75, Math.max(.45, self-.10)) : .58;
+        if(a.g>=bar && gapS>=.10 && (ratio==null || ratio>=.8)){ confident=true; how='details'; } }
+    }
     else confident = a.g>=.80 && gapG>=.12;
-    const noMatch = !confident && (q.gs ? a.g<.30 : a.g<.5);
+    const unlike = !!(q.gs && !confident && ((self && a.g < self-.22) || (ratio!=null && ratio<.5)));   // probably a different item
+    const noMatch = !confident && (q.gs ? (a.g<.30 || unlike) : a.g<.5);
     const candidates = top.filter((c,i)=> i===0 || c.score >= (q.gs ? Math.max(.25, a.score-.25) : a.score-.15))
       .map(c=>({serial:c.serial, conf:+Math.min(.99,Math.max(c.g,c.score-.1)).toFixed(2), g:c.g, detail:c.detail, kind:'photo'}));
-    return {candidates, confident, noMatch, plain, how};
+    return {candidates, confident, noMatch, plain, how, unlike, single:!self};
   },
   async identify(input){
     const t0=performance.now();
@@ -1203,10 +1237,10 @@ const SheetSync = {
       const serial=parseInt(r.code,10); if(!(serial>0)) continue;
       const price=+r.priceIndia||0, priceIntl=(r.priceIntl===''||r.priceIntl==null)?intlDefault(price):+r.priceIntl;
       let p=Products.get(serial);
-      const cat=CATEGORIES.includes(r.category)?r.category:C;
+      const cat=String(r.category||'').trim()||C;   // any category name from the sheet is accepted
       const f={name:String(r.name||'Product '+ser(serial)),category:cat,price,priceIntl,stock:Math.max(0,parseInt(r.stock,10)||0),size:String(r.size||''),description:String(r.description||'')};
       if(p){ Object.assign(p,f); if(r.photo) p.photo=r.photo; }
-      else{ p={serial,...f,art:DEFAULT_ART[cat],group:'',photo:r.photo||null,refs:[],refImgs:[]}; DB.products.push(p); }
+      else{ p={serial,...f,art:artFor(cat),group:'',photo:r.photo||null,refs:[],refImgs:[]}; DB.products.push(p); }
       DB.settings.rowSent=DB.settings.rowSent||{}; DB.settings.photoSent=DB.settings.photoSent||{};
       DB.settings.rowSent[serial]=shHash(JSON.stringify(this.row(p))); if(p.photo) DB.settings.photoSent[serial]=shHash(p.photo);
       n++;
@@ -1330,13 +1364,13 @@ var Cloud = (function(){
       save(); if(!s.metadata.fromCache) CL.got.s=true; CL.maybeMigrate(); CL.soft();
       try{ SheetSync.push(); }catch(e){}
     },
-    settingsKey(){ const t=DB.settings; return JSON.stringify([t.intlBase||'',t.rates||{},t.customCurrencies||{},t.customCountries||{}]); },
+    settingsKey(){ const t=DB.settings; return JSON.stringify([t.intlBase||'',t.rates||{},t.customCurrencies||{},t.customCountries||{},t.customCategories||[]]); },
     onSettings(s){
       if(!s.exists()){ if(!s.metadata.fromCache){ CL.settingsReady=true; CL.lastSettings=''; CL.settingsDirty(); } return; }
       const d=s.data();
       if(d.intlBase) DB.settings.intlBase=d.intlBase;
       if(d.rates) DB.settings.rates=d.rates;
-      DB.settings.customCurrencies=d.customCurrencies||{}; DB.settings.customCountries=d.customCountries||{};
+      DB.settings.customCurrencies=d.customCurrencies||{}; DB.settings.customCountries=d.customCountries||{}; DB.settings.customCategories=d.customCategories||[];
       Object.assign(CURRENCIES,DB.settings.customCurrencies); Object.assign(COUNTRIES,DB.settings.customCountries);
       CL.settingsReady=true; CL.lastSettings=CL.settingsKey(); save(); CL.soft();
     },
@@ -1344,7 +1378,7 @@ var Cloud = (function(){
       if(!CL.live() || !CL.isOwner() || !CL.settingsReady) return;
       clearTimeout(CL._st);
       CL._st=setTimeout(()=>{ const k=CL.settingsKey(); if(k===CL.lastSettings) return; CL.lastSettings=k; const t=DB.settings;
-        CL.w(CL.fb.setDoc(CL.fb.doc(CL.db,'settings','shop'),JSON.parse(JSON.stringify({intlBase:t.intlBase||'USD',rates:t.rates||{},customCurrencies:t.customCurrencies||{},customCountries:t.customCountries||{},updatedAt:Date.now()}))),'settings'); },800);
+        CL.w(CL.fb.setDoc(CL.fb.doc(CL.db,'settings','shop'),JSON.parse(JSON.stringify({intlBase:t.intlBase||'USD',rates:t.rates||{},customCurrencies:t.customCurrencies||{},customCountries:t.customCountries||{},customCategories:t.customCategories||[],updatedAt:Date.now()}))),'settings'); },800);
     },
     maybeMigrate(){
       if(CL.migrated || !CL.got.p || !CL.got.s || !CL.isOwner()) return; CL.migrated=true;
@@ -1505,7 +1539,7 @@ V.scan = () => {
     const unsure = !sc.result.confident;
     return `${topbar(unsure?'Similar products found':'Choose the product',{sub:'Step 2 · Seller confirmation'})}<div class="pad stack" style="padding-bottom:0">
       ${unsure?`<div class="note warn">${ic('alert')}<span><b>We found similar products.</b> The AI is not sure, so nothing was selected automatically. Please select the correct product.</span></div>`:`<div class="note info">${ic('info')}<span>Pick the product that matches what the customer is buying.</span></div>`}
-      ${sc.result.noMatch?`<div class="note bad">${ic('alert')}<span><b>No close match in your catalogue</b> (best ${Math.round((sc.result.candidates[0]||{conf:0}).conf*100)}%). If this is a new product, add it with this photo.</span></div><button class="btn btn-primary" data-act="addFromScan">${ic('plus')} Add as new product with this photo</button>`:''}
+      ${sc.result.noMatch?`<div class="note bad">${ic('alert')}<span><b>${sc.result.unlike?'This looks like a different item':'No close match in your catalogue'}</b> (best ${Math.round((sc.result.candidates[0]||{conf:0}).conf*100)}%). ${sc.result.unlike?'It is less alike than that product’s own photos, e.g. a similar-coloured but different item. ':''}If it is a new product, add it with this photo; otherwise pick the right one below.</span></div><button class="btn btn-primary" data-act="addFromScan">${ic('plus')} Add as new product with this photo</button>`:''}
       ${qualityNote(sc.result)}
       <div class="compare" style="grid-template-columns:110px 1fr"><figure><img src="${sc.photo}" alt="Your photo"><figcaption>Your photo</figcaption></figure><p class="hint">${sc.result.plain?'This item has few details (plain surface), so the match is based on overall shape and colour. ':''}Compare shape, size, logo and colour. Look-alike products can have very different prices.</p></div>
       ${sc.options.map((o,i)=>{ const p=Products.get(o.serial); if(!p) return ''; const on=sc.selected===p.serial; return `<button class="opt ${on?'on':''}" data-act="pickOpt" data-arg="${p.serial}" aria-pressed="${on}"><img src="${Products.img(p)}" alt=""><span class="opt-body"><span class="opt-k">Option ${i+1}</span><b>${esc(p.name)}</b><span class="mono" style="font-size:12.5px">Serial No. ${ser(p.serial)}</span><span class="opt-meta">${esc(p.size)} · Stock ${p.stock}</span></span><span class="opt-end"><b>${inr(p.price)}</b>${o.conf!=null?`<small>${Math.round(o.conf*100)}% match</small>`:'<small>look-alike</small>'}<span class="radio"></span></span></button>`; }).join('')}
@@ -1673,6 +1707,16 @@ const Backend = {
 };
 const blobB64 = b => new Promise((res,rej)=>{ const f=new FileReader(); f.onload=()=>res(String(f.result).split(',')[1]); f.onerror=rej; f.readAsDataURL(b); });
 const isTouch = () => matchMedia('(pointer:coarse)').matches;
+const isMobile = () => /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+/* Open the customer's chat straight away.
+   "app" (default): whatsapp://send?phone=… opens that chat in the WhatsApp app on the phone or laptop,
+   with no in-between web page. (On a laptop the browser asks "Open WhatsApp?" the first time: tick "Always allow".)
+   "web": opens the chat in WhatsApp Web (laptop) / wa.me (phone) in a new tab. */
+function openWaChat(ph){
+  const mode=DB.settings.waOpen||'app';
+  if(mode==='web'){ const url=isMobile()?`https://wa.me/${ph}`:`https://web.whatsapp.com/send?phone=${ph}`; if(!window.open(url,'_blank')) location.href=url; return; }
+  const a=document.createElement('a'); a.href=`whatsapp://send?phone=${ph}`; a.rel='noopener'; document.body.appendChild(a); a.click(); a.remove();
+}
 function sendCard(s){
   return `<div class="card stack" style="gap:12px"><div class="disc-h"><b>Send bill to customer</b><span id="sentTag">${sentTag(s)}</span></div>
     <div class="row2"><label class="fld"><span>WhatsApp number</span><input id="sPhone" inputmode="tel" value="${esc(s.phone)}" placeholder="98765 43210" data-in="salePhone" autocomplete="off"></label><label class="fld"><span>Email</span><input id="sEmail" type="email" inputmode="email" value="${esc(s.email||'')}" placeholder="name@gmail.com" data-in="saleEmail" autocomplete="off"></label></div>
@@ -1685,14 +1729,15 @@ function refsCard(){
     ${refs.length?`<div class="ref-grid">${refs.map((u,i)=>`<div class="ref"><img src="${u}" alt="Extra photo ${i+1}"><button type="button" data-act="refDel" data-arg="${i}" aria-label="Remove photo">×</button></div>`).join('')}</div>`:''}
     <div class="row2"><button type="button" class="btn btn-ghost" data-act="adminCamExtra" ${full?'disabled':''}>${ic('camera')} Take ${['back','side','top','close-up','extra'][refs.length]||'extra'} photo</button><button type="button" class="btn btn-ghost" data-act="refUpload" ${full?'disabled':''}>${ic('upload')} Upload</button></div></div>`;
 }
-function readForm(){ const v=id=>{ const e=$(id); return e?e.value:''; }; return {name:v('#f-name'),category:v('#f-cat'),price:v('#f-price'),priceIntl:v('#f-intl'),stock:v('#f-stock'),size:v('#f-size'),description:v('#f-desc')}; }
+function readForm(){ const v=id=>{ const e=$(id); return e?e.value:''; }; return {newCat:v('#f-newcat'),name:v('#f-name'),category:v('#f-cat'),price:v('#f-price'),priceIntl:v('#f-intl'),stock:v('#f-stock'),size:v('#f-size'),description:v('#f-desc')}; }
 function sentTag(s){ const sh=s.shared||{}; const t=[sh.wa&&'WhatsApp',sh.mail&&'Email',sh.pdf&&'PDF'].filter(Boolean); return t.length?`<span class="badge b-ok">Sent: ${t.join(', ')}</span>`:''; }
 function sendBtns(s){
   const ph=normPhone(s.phone,s.country), em=validEmail(s.email), B=Backend.status;
   return `<div class="stack" style="gap:8px">
     <div class="row2"><button class="btn btn-wa" data-act="sendWa" ${ph?'':'disabled'}>${ic('chat')} WhatsApp PDF</button><button class="btn btn-primary" data-act="sendMail" ${em?'':'disabled'}>${ic('mail')} Email PDF</button></div>
     <button class="btn btn-ghost" data-act="sendPdf">${ic('file')} Share or save PDF</button>
-    <p class="hint">${!ph?'Add the customer’s WhatsApp number. ':B.whatsapp?`<b>WhatsApp:</b> the PDF goes straight to <b>+${ph}</b>, then their chat opens. `:`<b>WhatsApp:</b> direct sending is not set up, so the chat with <b>+${ph}</b> opens and the PDF is saved for you to attach. `}${!em?'Add an email address to email the PDF. ':B.email?'<b>Email:</b> the PDF is emailed straight to the customer. ':'<b>Email:</b> direct sending is not set up. '}${B.whatsapp&&B.email?'':'<button class="link" data-act="go" data-arg="sending">Set up direct sending</button>'}</p></div>`;
+    <label class="wa-open"><span>Open WhatsApp in</span><select id="waOpen" data-ch="waOpen"><option value="app" ${(DB.settings.waOpen||'app')==='app'?'selected':''}>WhatsApp app</option><option value="web" ${DB.settings.waOpen==='web'?'selected':''}>WhatsApp Web (browser)</option></select></label>
+    <p class="hint">${!ph?'Add the customer’s WhatsApp number. ':B.whatsapp?`<b>WhatsApp:</b> the chat with <b>+${ph}</b> opens and the PDF is sent straight to it. `:`<b>WhatsApp:</b> the chat with <b>+${ph}</b> opens directly and the PDF is saved at the same time: tap 📎 → Document → the newest PDF. `}${!em?'Add an email address to email the PDF. ':B.email?'<b>Email:</b> the PDF is emailed straight to the customer. ':'<b>Email:</b> direct sending is not set up. '}${B.whatsapp&&B.email?'':'<button class="link" data-act="go" data-arg="sending">Set up direct sending</button>'}</p></div>`;
 }
 function markShared(kind){ const s=curSale(); if(!s) return; s.shared=Object.assign({},s.shared,{[kind]:Date.now()}); save(); Cloud.touchSale(s); const t=$('#sentTag'); if(t) t.innerHTML=sentTag(s); }
 
@@ -1797,7 +1842,7 @@ V.inventory = () => {
     <div class="inv-sum"><button class="${f.f==='all'?'on':''}" data-act="invF" data-arg="all"><b>${n.all}</b><span>All products</span></button><button class="${f.f==='low'?'on':''}" data-act="invF" data-arg="low"><b style="color:var(--warn)">${n.low}</b><span>⚠ Low stock</span></button><button class="${f.f==='out'?'on':''}" data-act="invF" data-arg="out"><b style="color:var(--bad)">${n.out}</b><span>Out of stock</span></button></div>
     <button class="btn btn-primary" data-act="adminNew">${ic('plus')} Add product · gets Serial No. ${ser(Products.nextSerial())}</button>
     <label class="search">${ic('search')}<input id="invQ" type="search" placeholder="Serial No., name or category" value="${esc(f.q)}" data-in="invq" aria-label="Search inventory"></label>
-    <div class="filter-row"><select id="invCat" data-ch="invCat" aria-label="Category"><option value="">All categories</option>${CATEGORIES.map(c=>`<option ${f.cat===c?'selected':''}>${c}</option>`).join('')}</select><button class="chip" data-act="go" data-arg="admin">${ic('edit')} Manage products</button></div>
+    <div class="filter-row"><select id="invCat" data-ch="invCat" aria-label="Category"><option value="">All categories</option>${allCategories().map(c=>`<option ${f.cat===c?'selected':''}>${esc(c)}</option>`).join('')}</select><button class="chip" data-act="go" data-arg="admin">${ic('edit')} Manage products</button></div>
     <div class="inv-head"><span></span><span>Serial · Product · Price</span><span>Stock · Status</span></div>
     <div class="list" id="invList">${invList()}</div>
     <p class="hint">Tap a product for Stock In / Stock Out. Low stock means ${LOW} or fewer pieces left.</p>
@@ -1828,7 +1873,7 @@ V.more = () => {
   const row=(act,arg,icon,t,sub)=>`<button class="list-row" data-act="${act}" data-arg="${arg}">${ic(icon)}<span class="lr-main"><b>${t}</b><small>${sub}</small></span>${ic('chev','chev')}</button>`;
   return `${topbar('More')}<div class="pad stack menu">
     <div class="list">${row('go','account','user','Account & team',esc(Cloud.email()||'Not signed in')+(Cloud.role?' · '+Cloud.role:''))}${row('exhibition','','store','Exhibition mode','Fast counter screen for busy stalls')}${row('go','search','search','Search product','Serial number, name or category')}${row('tab','bills','receipt','Sales history','All invoices')}</div>
-    <div class="list">${own(row('go','admin','edit','Admin · Product management','Add products, edit price, stock, image'))}${row('tab','inventory','box','Inventory','Stock in, stock out, low stock')}${own(row('go','sync','cloud','Google Sheet copy',SheetSync.on()?(SheetSync.pending()?SheetSync.pending()+' bills waiting to send':'Connected'):'Optional report copy, not connected'))}${own(row('go','rates','cash','Currencies & rates','Rates, and add your own currencies'))}${row('go','sending','chat','WhatsApp & email sending',Backend.status.whatsapp||Backend.status.email?'Direct PDF sending is on':'Set up direct PDF sending')}</div>
+    <div class="list">${own(row('go','admin','edit','Admin · Product management','Add products, edit price, stock, image'))}${row('tab','inventory','box','Inventory','Stock in, stock out, low stock')}${own(row('go','sync','cloud','Google Sheet copy',SheetSync.on()?(SheetSync.pending()?SheetSync.pending()+' bills waiting to send':'Connected'):'Optional report copy, not connected'))}${own(row('go','rates','cash','Currencies & rates','Rates, and add your own currencies'))}${own(row('go','categories','grid','Categories','Add your own product categories'))}${row('go','sending','chat','WhatsApp & email sending',Backend.status.whatsapp||Backend.status.email?'Direct PDF sending is on':'Set up direct PDF sending')}</div>
     <div class="list">${own(row('go','accuracy','spark','Scanner accuracy test','Measure how often scans are right'))}${row('go','about','layers','How the system works','Workflow, architecture and future roadmap')}${own(row('resetAsk','','reset','Clear data on this phone','Reloads everything from the cloud'))}</div>
     <p class="hint" style="text-align:center">Products, photos and bills are shared by every signed-in phone</p>
   </div>`;
@@ -1871,7 +1916,8 @@ V.adminEdit = () => {
     <p class="hint" style="margin-top:-6px">Catalogue photos are what the scanner compares against. Use a clear, front-facing photo.</p>
     ${refsCard()}
     <label class="fld"><span>Product name</span><input id="f-name" value="${esc(p.name)}" placeholder="e.g. Handmade Sunflower Wall Hanging" autocomplete="off"></label>
-    <label class="fld"><span>Category</span><select id="f-cat">${CATEGORIES.map(c=>`<option ${p.category===c?'selected':''}>${c}</option>`).join('')}</select></label>
+    <label class="fld"><span>Category</span><select id="f-cat" data-ch="fcat">${allCategories().map(c=>`<option ${p.category===c?'selected':''}>${esc(c)}</option>`).join('')}<option value="__new" ${p.category==='__new'?'selected':''}>＋ New category…</option></select></label>
+    <label class="fld" id="newCatBox" ${p.category==='__new'?'':'hidden'}><span>New category name</span><input id="f-newcat" maxlength="40" value="${esc(p.newCat||'')}" placeholder="e.g. Mobile Accessories" autocomplete="off"></label>
     <div class="row2"><label class="fld"><span>Indian price (₹)</span><input id="f-price" type="number" inputmode="numeric" min="0" value="${p.price}"></label><label class="fld"><span>International price (${curInfo(intlBase()).sym.trim()} ${intlBase()})</span><input id="f-intl" type="number" inputmode="decimal" min="0" step="0.01" value="${p.priceIntl??''}" placeholder="for foreign customers"></label></div>
     <div class="row2"><label class="fld"><span>Stock</span><input id="f-stock" type="number" inputmode="numeric" min="0" value="${p.stock}"></label><p class="hint" style="align-self:end">Stock goes down automatically when a bill is confirmed. Edit it here only for corrections.</p></div>
     <label class="fld"><span>Size / variant</span><input id="f-size" value="${esc(p.size)}" placeholder="e.g. 12 × 18 in" autocomplete="off"></label>
@@ -1928,6 +1974,18 @@ V.sending = () => {
       <ol class="steps-list"><li>At developers.facebook.com create an app and add the <b>WhatsApp</b> product.</li><li>Copy the <b>Phone number ID</b> and an <b>access token</b> into <span class="mono">config.json</span> (<span class="mono">whatsapp.phone_number_id</span>, <span class="mono">whatsapp.access_token</span>).</li><li>WhatsApp only lets a business message a customer first with an approved template. Create a <b>Utility</b> template with a <b>Document</b> header and body “Thank you for shopping at Shubh Laabh Creations. Your invoice {{1}} is attached.” Put its name in <span class="mono">whatsapp.template</span>.</li><li>While testing, add your own numbers as test recipients in the Meta app.</li></ol></div>
     <button class="btn btn-primary" data-act="checkBackend">${ic('refresh')} Check again</button>
     <p class="hint">Direct sending works when the app is opened at http://localhost:5178 (started with serve.py). Without it, WhatsApp opens the customer’s chat and saves the PDF to attach, and email opens your mail app.</p>
+  </div>`;
+};
+V.categories = () => {
+  const cats=allCategories(), custom=DB.settings.customCategories||[], n=c=>DB.products.filter(p=>p.category===c).length;
+  return `${topbar('Categories')}<div class="pad stack">
+    <div class="card stack" style="gap:10px"><b>Add a category</b>
+      <label class="fld"><span>Category name</span><input id="nc-cat" maxlength="40" placeholder="e.g. Mobile Accessories" autocomplete="off"></label>
+      <p class="err" id="nc-cat-err" hidden></p>
+      <button class="btn btn-primary" data-act="addCat">${ic('plus')} Add category</button>
+      <p class="hint">New categories appear in the product form, Inventory filter and the Scan screen buttons, on every device.</p></div>
+    <div class="list">${cats.map(c=>`<div class="list-row"><span class="lr-main"><b>${esc(c)}</b><small>${n(c)} product${n(c)===1?'':'s'}${CATEGORIES.includes(c)?' · built-in':''}</small></span>${custom.includes(c)&&!n(c)?`<button class="link" data-act="delCat" data-arg="${esc(c)}">Remove</button>`:''}</div>`).join('')}</div>
+    <p class="hint">A category can be removed once no product uses it.</p>
   </div>`;
 };
 V.rates = () => {
@@ -2255,24 +2313,21 @@ const A = {
   openInvoice(no){ go('invoice',{id:no}); },
   /* WhatsApp: the PDF only, no text message */
   async sendWa(){
-    const s=curSale(); if(!s) return; const ph=normPhone(s.phone,s.country); if(!ph) return;
-    const chat=`https://wa.me/${ph}`;
+    const s=curSale(); if(!s) return; const ph=normPhone(s.phone,s.country); if(!ph) return toast('Add a valid WhatsApp number first');
+    const blob = PdfCache.key===pdfKey(s) ? PdfCache.blob : null;
     if(Backend.status.whatsapp){                        // fully direct: PDF delivered by the WhatsApp Business API
-      const w=window.open('about:blank','_blank');      // opened now so the browser allows it; pointed at the chat after sending
+      openWaChat(ph);                                   // chat opens at once (needs the tap); the PDF arrives a few seconds later
       toast('Sending the PDF on WhatsApp…');
-      try{ const blob=await getPdf(s); await Backend.post('/api/send-whatsapp',{to:ph,filename:pdfName(s),pdf:await blobB64(blob),invoice:s.no,customer:s.customer,total:money(s.total,saleCur(s))});
-        markShared('wa'); toast('✓ PDF delivered on WhatsApp to +'+ph); if(w) w.location.href=chat; }
-      catch(e){ if(w) w.close(); toast('WhatsApp: '+e.message); }
+      try{ const b2=blob||await getPdf(s); await Backend.post('/api/send-whatsapp',{to:ph,filename:pdfName(s),pdf:await blobB64(b2),invoice:s.no,customer:s.customer,total:money(s.total,saleCur(s))});
+        markShared('wa'); toast('✓ PDF delivered on WhatsApp to +'+ph); }
+      catch(e){ toast('WhatsApp: '+e.message); }
       return;
     }
-    const blob = PdfCache.key===pdfKey(s) ? PdfCache.blob : null;
-    if(blob && isTouch() && navigator.canShare){       // phone: share sheet with the PDF attached
-      const file=new File([blob],pdfName(s),{type:'application/pdf'});
-      if(navigator.canShare({files:[file]})){ try{ await navigator.share({files:[file]}); markShared('wa'); }catch(e){} return; }
-    }
-    const w=window.open(chat,'_blank');                 // laptop: open the customer's chat at once…
+    // 1) save the PDF now (ready to attach), 2) open that customer's chat directly — both in the same tap
+    const saving = savePdf(s, blob||undefined);
+    openWaChat(ph);
     markShared('wa');
-    if(await savePdf(s,blob||undefined)) toast((w?'WhatsApp opened. ':'Open WhatsApp: '+chat+' · ')+'Attach the downloaded PDF: 📎 → Document → '+pdfName(s));
+    if(await saving) toast('Chat with +'+ph+' opened. Attach the PDF: 📎 → Document → '+pdfName(s));
   },
   async sendMail(){
     const s=curSale(); if(!s || !validEmail(s.email)) return;
@@ -2311,6 +2366,8 @@ const A = {
     const cs=Object.assign({},DB.settings.customCountries); Object.keys(cs).forEach(n=>{ if(cs[n].cur===k){ delete cs[n]; delete COUNTRIES[n]; } }); DB.settings.customCountries=cs;
     save(); render(); toast(k+' removed. Old bills in '+k+' still show correctly.');
   },
+  addCat(){ const r=addCategory($('#nc-cat').value); const err=$('#nc-cat-err'); if(r.err){ err.textContent=r.err; err.hidden=false; return; } render(); toast(r.added?'Category “'+r.name+'” added':'“'+r.name+'” already exists'); },
+  delCat(c){ if(DB.products.some(p=>p.category===c)) return toast('Move its products to another category first'); DB.settings.customCategories=(DB.settings.customCategories||[]).filter(x=>x!==c); save(); render(); toast('Category removed'); },
   async checkBackend(){ await Backend.check(); render(); toast(Backend.status.whatsapp||Backend.status.email?'Direct sending is connected':'Not connected yet. Check config.json and that the app runs from localhost:5178'); },
   async sendPdf(){
     const s=curSale(); if(!s) return;
@@ -2347,16 +2404,17 @@ const A = {
   async adminSnap(){ if(S.snapping) return; S.snapping=true; const ph=await Cam.snapBest(); S.snapping=false; if(!ph){ toast('Camera is still starting. Try again.'); return; }
     const extra=S.sheet && S.sheet.target==='extra'; if(extra) S.draftRefs.push(await downscale(ph,240)); else S.draftPhoto=await downscale(ph,360);
     S.camWanted=false; S.sheet=null; Cam.stop(); render(); toast(extra?'Photo added to this product. Tap Save to keep it.':'Photo added. Tap Save to keep it.'); },
-  adminArt(){ S.draftPhoto=null; S.formDraft=null; const isNew=S.params.id==null; const cat=$('#f-cat').value; const p=isNew?{art:DEFAULT_ART[cat]}:Products.get(S.params.id); $('#pimg').src=Products.img({...p,art:isNew?DEFAULT_ART[cat]:p.art,photo:null}); },
+  adminArt(){ S.draftPhoto=null; S.formDraft=null; const isNew=S.params.id==null; const cat=$('#f-cat').value; const p=isNew?{art:artFor(cat)}:Products.get(S.params.id); $('#pimg').src=Products.img({...p,art:isNew?artFor(cat):p.art,photo:null}); },
   async adminSave(){
     if(!Cloud.isOwner()){ toast('Only the owner can add or change products'); return; }
-    const v=id=>$(id).value.trim(); const name=v('#f-name'), cat=v('#f-cat'), price=parseInt(v('#f-price'),10), priceIntl=parseFloat(v('#f-intl')), stock=parseInt(v('#f-stock'),10), size=v('#f-size'), desc=v('#f-desc');
+    const v=id=>$(id).value.trim(); const name=v('#f-name'); let cat=v('#f-cat'); const price=parseInt(v('#f-price'),10), priceIntl=parseFloat(v('#f-intl')), stock=parseInt(v('#f-stock'),10), size=v('#f-size'), desc=v('#f-desc');
     const err=$('#f-err'); const fail=m=>{ err.textContent=m; err.hidden=false; };
+    if(cat==='__new'){ const r=addCategory(v('#f-newcat')); if(r.err) return fail(r.err); cat=r.name; if(r.added) toast('New category “'+cat+'” added'); }
     if(!name) return fail('Enter a product name.'); if(!(price>0)) return fail('Enter an Indian price above ₹0.'); if(!(priceIntl>0)) return fail('Enter the international price (above 0).'); if(!(stock>=0)) return fail('Enter the stock (0 or more).');
     const isNew=S.params.id==null;
     if(isNew){
       const serial=Products.nextSerial();
-      DB.products.push({serial,name,category:cat,price,priceIntl,stock,size,description:desc,art:DEFAULT_ART[cat],group:'',photo:S.draftPhoto||null,refs:[],refImgs:(S.draftRefs||[]).slice(0,5)});
+      DB.products.push({serial,name,category:cat,price,priceIntl,stock,size,description:desc,art:artFor(cat),group:'',photo:S.draftPhoto||null,refs:[],refImgs:(S.draftRefs||[]).slice(0,5)});
       Matcher.indexProduct(Products.get(serial));
       Inventory.log('new',serial,stock,0,stock,'Product added · Serial No. '+ser(serial));
       save(); SheetSync.push(); Cloud.saveProduct(Products.get(serial)); S.draftPhoto=undefined; S.formDraft=null; S.draftRefs=null; S.stack.pop(); S.view='admin'; S.params={}; render(); toast(`Added as Serial No. ${ser(serial)}`);
@@ -2412,6 +2470,8 @@ document.addEventListener('change',e=>{ const ch=e.target.dataset && e.target.da
   if(ch==='teamRole'){ const em=e.target.dataset.email; Cloud.w(Cloud.fb.setDoc(Cloud.fb.doc(Cloud.db,'roles',em),{role:v==='owner'?'owner':'staff',email:em,at:Date.now()}),'team'); return; }
   if(ch==='invCat'){ S.inv.cat=v; $('#invList').innerHTML=invList(); }
   if(ch==='autoAdd'){ DB.settings.autoAdd=e.target.checked; save(); }
+  if(ch==='waOpen'){ DB.settings.waOpen=v; Store.save(DB); }
+  if(ch==='fcat'){ const box=$('#newCatBox'); if(box){ box.hidden = v!=='__new'; if(v==='__new') $('#f-newcat').focus(); } }
   if(ch==='aiMode'){ DB.settings.aiMode=v; save(); location.reload(); }
   if(ch==='country'){ DB.cart.country=v; if(COUNTRIES[v]) DB.cart.currency=COUNTRIES[v].cur; if(DB.cart.discType==='amt') DB.cart.discVal=0; save(); render(); }
   if(ch==='currency'){ DB.cart.currency=v; if(DB.cart.discType==='amt') DB.cart.discVal=0; save(); render(); }
